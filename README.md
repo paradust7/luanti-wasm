@@ -6,15 +6,28 @@ This is an experimental port of Minetest to the web using emscripten/WebAssembly
 
 System Requirements
 -------------------
-This has only been tested on Ubuntu 20.04.
 
-* Ubuntu: apt-get install -y build-essential cmake tclsh
+You will need to install the following minimal dependencies depending on your operating system:
+
+**Fedora**
+
+```bash
+dnf install -y git make cmake gcc patch zstd tcl perl-FindBin
+```
+
+**Ubuntu**
+
+```bash
+apt-get install -y build-essential cmake tclsh
+```
 
 Building
 ---------
 
-    cd minetest-wasm
-    ./build_all.sh
+```bash
+cd minetest-wasm
+./build_all.sh
+```
 
 Installation
 ------------
