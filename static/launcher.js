@@ -540,6 +540,8 @@ class LuantiArgs {
         if (this.gameid) args.push('--gameid', this.gameid);
         if (this.address) args.push('--address', this.address);
         if (this.port) args.push('--port', this.port.toString());
+        if (this.trace) args.push('--trace');
+        if (this.verbose) args.push('--verbose');
         args.push(...this.extra);
         return args;
     }
@@ -553,6 +555,8 @@ class LuantiArgs {
         if (this.gameid) params.append('gameid', this.gameid);
         if (this.address) params.append('address', this.address);
         if (this.port) params.append('port', this.port.toString());
+        if (this.trace) params.append('trace', '');
+        if (this.verbose) params.append('verbose', '');
         const extra_packs = [];
         this.packs.forEach(v => {
             if (v != 'base' && v != 'minetest_game' && v != 'devtest' && v != this.gameid) {
@@ -578,6 +582,8 @@ class LuantiArgs {
         if (params.has('gameid')) r.gameid = params.get('gameid');
         if (params.has('address')) r.address = params.get('address');
         if (params.has('port')) r.port = parseInt(params.get('port'));
+        if (params.has('verbose')) r.verbose = true;
+        if (params.has('trace')) r.trace = true;
         if (r.gameid && r.gameid != 'minetest_game' && r.gameid != 'devtest' && r.gameid != 'base') {
             r.packs.push(r.gameid);
         }
