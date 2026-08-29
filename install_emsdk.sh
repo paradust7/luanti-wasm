@@ -21,8 +21,8 @@ rm -rf emsdk
 git clone https://github.com/emscripten-core/emsdk.git
 
 pushd emsdk
-./emsdk install 6.0.4
-./emsdk activate 6.0.4
+./emsdk install 6.0.8
+./emsdk activate 6.0.8
 popd
 
 ./apply_patches.sh emsdk
