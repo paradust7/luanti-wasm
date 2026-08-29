@@ -1,0 +1,19 @@
+--- emsdk-orig/upstream/emscripten/src/lib/libwasmfs_opfs.js
++++ emsdk/upstream/emscripten/src/lib/libwasmfs_opfs.js
+@@ -86,6 +86,16 @@
+       // (it complains on a duplicate type annotation), so just suppress it.
+       /** @suppress {checkTypes} */
+       let root = await navigator.storage.getDirectory();
++      // Root the backend at a directory inside OPFS rather than at the OPFS
++      // root itself, so that a path in persistent storage is the same path the
++      // program sees: OPFS luanti/worlds is /luanti/worlds to the program.
++      //
++      // There is no way to tell a backend which directory to be rooted at:
++      // _wasmfs_opfs_init_root_directory takes no path, and
++      // OPFSBackend::createDirectory() always hands out handle 1. So the name
++      // is fixed here, which is enough because only one OPFS backend is ever
++      // created.
++      root = await root.getDirectoryHandle('luanti', { create: true });
+       wasmfsOPFSDirectoryHandles.allocated.push(root);
+     }
+     wasmfsOPFSProxyFinish(ctx);

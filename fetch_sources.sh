@@ -19,9 +19,6 @@ getsource "https://www.libarchive.org/downloads/libarchive-3.6.1.tar.xz" 5a411ac
 # Be sure to add new entries here to .gitignore
 getrepo zstd "https://github.com/facebook/zstd.git" f8745da6ff1ad1e7bab384bd1f9d742439278e99
 
-# Minetest Game
-getrepo minetest_game "https://github.com/luanti-org/minetest_game.git" 052ccb09280a1fa52022c7e120437b1e6dc82771
-
 # These repos are part of the fork
 getrepo webshims "https://github.com/paradust7/webshims.git" 0767fdedd87f61a28a34f6444b669caf563a9fd5
-getrepo luanti "https://github.com/paradust7/luanti.git" 134d7da0afdec63c6a3e71bcada561c39ad21707
+getrepo luanti "https://github.com/paradust7/luanti.git" 6162abc2e376d2296cca4cf672735d7fe4154618

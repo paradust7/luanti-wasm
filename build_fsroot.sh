@@ -31,22 +31,16 @@ no_mtg_notification = true
 no_keycode_migration_warning = true
 EOF
 
-rm -rf games/minetest_game
 mkdir -p games
-cp -a "$SOURCES_DIR"/minetest_game games
-cd games/minetest_game
-rm -rf ".git" ".github"
 
 popd
 
 
-#############################################
-# Copy root certificates for OpenSSL
-pushd fsroot
-mkdir -p etc/ssl/certs
+# These live outside /luanti, outside of OPFS.
+rm -rf certsroot
+mkdir -p certsroot/etc/ssl/certs
 # May be a symlink, use cat to copy contents
-cat /etc/ssl/certs/ca-certificates.crt > etc/ssl/certs/ca-certificates.crt
-popd
+cat /etc/ssl/certs/ca-certificates.crt > certsroot/etc/ssl/certs/ca-certificates.crt
 
 
 # Make fsroot.tar
@@ -55,6 +49,15 @@ pushd fsroot
 tar cf ../fsroot.tar .
 popd
 
+# Make certs.tar
+rm -f certs.tar
+pushd certsroot
+tar cf ../certs.tar .
+popd
+
 # Compress with ZSTD
 rm -f fsroot.tar.zst
 zstd --ultra -22 fsroot.tar
+
+rm -f certs.tar.zst
+zstd --ultra -22 certs.tar

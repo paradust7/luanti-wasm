@@ -232,6 +232,7 @@ function callMain() {
     mtScheduler.setCondition("main_called");
 }
 
+var emloop_init_fs;
 var emloop_install_pack;
 var emloop_set_conf;
 var emloop_invoke_main;
@@ -242,7 +243,8 @@ var emsocket_set_vpn;
 
 // Called when the wasm module is ready
 function emloop_ready() {
-    emloop_install_pack = cwrap("emloop_install_pack", null, ["number", "number", "number"]);
+    emloop_init_fs = cwrap("emloop_init_fs", null, ["number"]);
+    emloop_install_pack = cwrap("emloop_install_pack", null, ["number", "number", "number", "number"]);
     emloop_set_conf = cwrap("emloop_set_conf", null, ["number"]);
     emloop_invoke_main = cwrap("emloop_invoke_main", null, ["number", "number"]);
     irrlicht_resize = cwrap("irrlicht_resize", null, ["number", "number"]);
@@ -250,6 +252,40 @@ function emloop_ready() {
     emsocket_set_proxy = cwrap("emsocket_set_proxy", null, ["number"]);
     emsocket_set_vpn = cwrap("emsocket_set_vpn", null, ["number"]);
     mtScheduler.setCondition("wasmReady");
+}
+
+// Ask the wasm module to mount /luanti. It answers with emloop_fs_ready().
+function initFs() {
+    emloop_init_fs(mtLauncher.storageAvailable ? 1 : 0);
+}
+
+// Resolves to true once the wasm module reports that /luanti is backed by OPFS.
+var mtFsActiveResolve;
+const mtFsActive = new Promise((resolve) => { mtFsActiveResolve = resolve; });
+
+// Called by the wasm module once /luanti has a backend. `active` is 1 if that
+// backend is OPFS, meaning the tree survives a page reload.
+function emloop_fs_ready(active) {
+    mtLauncher.storageActive = (active != 0);
+    consolePrint(mtLauncher.storageActive
+        ? "Persistent storage (OPFS) is enabled"
+        : "Persistent storage is not available; worlds will be lost when this page closes");
+    mtFsActiveResolve(mtLauncher.storageActive);
+    mtScheduler.setCondition("fsReady");
+}
+
+// Called by the wasm module while a pack is being unpacked.
+function emloop_pack_progress(name, fraction) {
+    if (mtLauncher && mtLauncher.onprogress) {
+        mtLauncher.onprogress(`install:${name}`, fraction);
+    }
+}
+
+// Called by the wasm module once a pack has finished unpacking.
+function emloop_pack_installed(name) {
+    if (mtLauncher && mtLauncher.onprogress) {
+        mtLauncher.onprogress(`install:${name}`, 1.0);
+    }
 }
 
 function makeArgv(args) {
@@ -555,7 +591,7 @@ class LuantiArgs {
         if (this.port) params.append('port', this.port.toString());
         const extra_packs = [];
         this.packs.forEach(v => {
-            if (v != 'base' && v != 'minetest_game' && v != 'devtest' && v != this.gameid) {
+            if (v != 'base' && v != this.gameid) {
                 extra_packs.push(v);
             }
         });
@@ -578,7 +614,7 @@ class LuantiArgs {
         if (params.has('gameid')) r.gameid = params.get('gameid');
         if (params.has('address')) r.address = params.get('address');
         if (params.has('port')) r.port = parseInt(params.get('port'));
-        if (r.gameid && r.gameid != 'minetest_game' && r.gameid != 'devtest' && r.gameid != 'base') {
+        if (r.gameid && r.gameid != 'base') {
             r.packs.push(r.gameid);
         }
         if (params.has('packs')) {
@@ -595,7 +631,114 @@ class LuantiArgs {
     }
 }
 
+// Persistent storage
+//
+// When the browser has an origin private file system (OPFS), the whole /luanti
+// tree lives there instead of in memory: worlds, minetest.conf, the cache and
+// anything installed from ContentDB survive a reload, and a data pack only has
+// to be downloaded and unpacked when its contents actually change.
+//
+// The wasm module does the mounting, because OPFS writes are only possible from
+// a worker. The page can still read it though, and doing so here means an
+// already-installed pack is never fetched in the first place.
+//
+// The OPFS tree mirrors the tree the module sees: the OPFS directory `luanti`
+// is what gets mounted at /luanti (see emsdk_wasmfs_opfs_subdir.patch), so a
+// path below is the module's own path without the leading slash.
+
+// Mirrors PACK_DB_DIR in mainloop.cpp.
+const PACK_DB_DIR = 'luanti/.packs';
+
+// These packs install outside /luanti (the CA certificate bundle lands in
+// /etc/ssl/certs, which is always in memory), so they cannot be remembered and
+// must be unpacked on every run.
+const VOLATILE_PACKS = new Set(['certs']);
+
+// A pack name becomes part of a URL and of a file name. Keep it boring.
+// Mirrors validPackName() in mainloop.cpp.
+function validPackName(name) {
+    return /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/.test(name);
+}
+
+function opfsSupported() {
+    return (typeof navigator !== 'undefined' && navigator.storage &&
+            typeof navigator.storage.getDirectory === 'function' &&
+            typeof FileSystemDirectoryHandle !== 'undefined' &&
+            typeof FileSystemFileHandle !== 'undefined');
+}
+
+async function opfsListNames(dir) {
+    const names = [];
+    if (typeof dir.keys === 'function') {
+        for await (const name of dir.keys()) {
+            names.push(name);
+        }
+    } else {
+        for await (const [name] of dir) {
+            names.push(name);
+        }
+    }
+    return names;
+}
+
+// Walks `path` from `dir`, one component at a time, since OPFS only ever hands
+// out a single child at a time.
+async function opfsGetDirectory(dir, path, create) {
+    for (const part of path.split('/')) {
+        if (part) {
+            dir = await dir.getDirectoryHandle(part, { create });
+        }
+    }
+    return dir;
+}
+
+// Returns the OPFS root, or null if this browser/origin has no usable one.
+async function openStorageRoot() {
+    if (!opfsSupported()) {
+        return null;
+    }
+    let root;
+    try {
+        root = await navigator.storage.getDirectory();
+        // Creating the pack database doubles as a check that this origin is
+        // actually allowed to write, and creates the directory the module
+        // mounts at /luanti before it tries to.
+        await opfsGetDirectory(root, PACK_DB_DIR, true);
+    } catch (err) {
+        consolePrint(`Could not open persistent storage: ${err}`);
+        return null;
+    }
+    return root;
+}
+
+// The version of `name` recorded by a previous run, or null if it is not
+// installed. Written by emloop_install_pack once unpacking succeeded.
+async function readPackVersion(root, name) {
+    try {
+        const dir = await opfsGetDirectory(root, PACK_DB_DIR, false);
+        const handle = await dir.getFileHandle(name + '.ver');
+        return (await (await handle.getFile()).text()).trim();
+    } catch (err) {
+        return null;
+    }
+}
+
+function getDefaultStorage() {
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has("storage")) {
+        return 'auto';
+    }
+    const storage = params.get("storage");
+    if (storage != 'auto' && storage != 'memory') {
+        alert(`Invalid storage parameter: ${storage}`);
+        return 'auto';
+    }
+    return storage;
+}
+
 class LuantiLauncher {
+    #storageProbe = null;
+
     constructor() {
         if (mtLauncher !== null) {
             throw new Error("There can be only one launcher");
@@ -614,12 +757,49 @@ class LuantiLauncher {
         this.packsDir = DEFAULT_PACKS_DIR;
         this.packsDirIsCors = false;
         this.conf = new Map();
+        // 'auto' | 'memory'
+        this.storageMode = getDefaultStorage();
+        // Set once the OPFS probe finishes / once the wasm module has mounted.
+        this.storageRoot = null;
+        this.storageAvailable = false;
+        this.storageActive = false;
+        this.#storageProbe = this.#probeStorage();
 
         mtScheduler.addCondition("wasmReady", loadWasm);
+        mtScheduler.addCondition("storageProbed");
+        mtScheduler.addCondition("fsReady", initFs, ['wasmReady', 'storageProbed']);
         mtScheduler.addCondition("launch_called");
-        mtScheduler.addCondition("ready", this.#notifyReady.bind(this), ['wasmReady']);
+        mtScheduler.addCondition("ready", this.#notifyReady.bind(this), ['fsReady']);
         mtScheduler.addCondition("main_called", callMain, ['ready', 'launch_called']);
         this.addPack('base');
+        this.addPack('certs');
+    }
+
+    async #probeStorage() {
+        if (this.storageMode != 'memory') {
+            this.storageRoot = await openStorageRoot();
+            this.storageAvailable = (this.storageRoot !== null);
+        }
+        mtScheduler.setCondition("storageProbed");
+    }
+
+    // True once the wasm module has confirmed /luanti is backed by OPFS.
+    // Only meaningful after 'onready'.
+    isPersistent() {
+        return this.storageActive;
+    }
+
+    // Ask the browser not to evict the saved worlds. Chrome decides silently
+    // from site engagement; Firefox prompts, so call this from a click handler.
+    async requestPersistence() {
+        if (!navigator.storage || !navigator.storage.persist) {
+            return false;
+        }
+        try {
+            return await navigator.storage.persist();
+        } catch (err) {
+            return false;
+        }
     }
 
     setProxy(url) {
@@ -652,7 +832,10 @@ class LuantiLauncher {
     }
 
     // Set a key/value pair in minetest.conf
-    // Overrides previous values of the same key
+    // Overrides previous values of the same key.
+    //
+    // These are applied as defaults: with persistent storage a key the player
+    // has since changed in-game keeps its saved value.
     setConf(key, value) {
         key = key.toString();
         value = value.toString();
@@ -698,19 +881,36 @@ class LuantiLauncher {
         if (mtScheduler.isSet("launch_called")) {
             throw new Error("Cannot add packs after launch");
         }
-        if (name == 'minetest_game' || name == 'devtest' || this.addedPacks.has(name))
+        if (this.addedPacks.has(name))
             return;
+        if (!validPackName(name)) {
+            throw new Error(`Invalid pack name: ${name}`);
+        }
         this.addedPacks.add(name);
 
         const fetchedCond = "fetched:" + name;
         const installedCond = "installed:" + name;
+        const packUrl = this.packsDir + '/' + name + '.pack';
+        // Pack URLs carry the release id and are served immutable, so the URL
+        // identifies the contents. A pack recorded under this version in
+        // persistent storage is already unpacked, and is left alone.
+        const version = VOLATILE_PACKS.has(name) ? '' : packUrl;
 
         let chunks = [];
         let received = 0;
+        let alreadyInstalled = false;
         // This is done here instead of at the bottom, because it needs to
-        // be delayed until after the 'wasmReady' condition.
+        // be delayed until after the 'fsReady' condition.
         // TODO: Add the ability to `await` a condition instead.
         const installPack = () => {
+            if (alreadyInstalled) {
+                mtScheduler.setCondition(installedCond);
+                if (this.onprogress) {
+                    this.onprogress(`download:${name}`, 1.0);
+                    this.onprogress(`install:${name}`, 1.0);
+                }
+                return;
+            }
             // Install
             const data = _malloc(received);
             let offset = 0;
@@ -718,19 +918,37 @@ class LuantiLauncher {
                 HEAPU8.set(arr, data + offset);
                 offset += arr.byteLength;
             }
-            emloop_install_pack(stringToNewUTF8(name), data, received);
-            _free(data);
-            mtScheduler.setCondition(installedCond);
+            chunks = [];
             if (this.onprogress) {
                 this.onprogress(`download:${name}`, 1.0);
-                this.onprogress(`install:${name}`, 1.0);
+                this.onprogress(`install:${name}`, 0.0);
             }
+            const namePtr = stringToNewUTF8(name);
+            const versionPtr = stringToNewUTF8(version);
+            // Takes ownership of `data`. Unpacking happens on the worker that
+            // runs main(), and reports back through emloop_pack_installed().
+            emloop_install_pack(namePtr, versionPtr, data, received);
+            _free(namePtr);
+            _free(versionPtr);
+            mtScheduler.setCondition(installedCond);
         };
         mtScheduler.addCondition(fetchedCond, null);
-        mtScheduler.addCondition(installedCond, installPack, ["wasmReady", fetchedCond]);
+        mtScheduler.addCondition(installedCond, installPack, ["fsReady", fetchedCond]);
         mtScheduler.addDep("main_called", installedCond);
 
-        const packUrl = this.packsDir + '/' + name + '.pack';
+        if (version) {
+            await this.#storageProbe;
+            // Only trust what the probe found once the module has confirmed
+            // that it really did mount OPFS at /luanti.
+            if (this.storageAvailable && await mtFsActive &&
+                    await readPackVersion(this.storageRoot, name) === version) {
+                consolePrint(`Pack ${name} is already installed`);
+                alreadyInstalled = true;
+                mtScheduler.setCondition(fetchedCond);
+                return;
+            }
+        }
+
         let resp;
         try {
             resp = await fetch(packUrl, this.packsDirIsCors ? { credentials: 'omit' } : {});
@@ -786,6 +1004,13 @@ class LuantiLauncher {
             this.addPack(this.args.gameid);
         }
         this.addPacks(this.args.packs);
+        if (this.storageActive) {
+            // Without this the saved worlds are only kept on a best-effort
+            // basis and the browser may evict them. launch() is called from a
+            // user gesture, which is the right moment for the permission
+            // prompt Firefox shows here.
+            this.requestPersistence();
+        }
         activateBody();
         fixGeometry();
         if (this.conf.size > 0) {

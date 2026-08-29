@@ -56,6 +56,10 @@ popd
 # Copy base file system pack
 cp "$BUILD_DIR/fsroot.tar.zst" "$PACKS_DIR/base.pack"
 
+# Copy the CA certificate pack. Unlike the others this one installs outside
+# /luanti, so it is never kept in persistent storage.
+cp "$BUILD_DIR/certs.tar.zst" "$PACKS_DIR/certs.pack"
+
 echo "DONE"
 
 # Optional script to customize deployment
