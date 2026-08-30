@@ -191,6 +191,16 @@ class LaunchScheduler {
         window.requestAnimationFrame(this.invokeCallbacks.bind(this));
     }
 
+    // Forget a condition that is never going to be satisfied. Anything waiting
+    // on it stops waiting, and it can be added again to try once more.
+    removeCondition(name) {
+        this.conditions.delete(name);
+        this.conditions.forEach(v => {
+            v[1].delete(name);
+        });
+        window.requestAnimationFrame(this.invokeCallbacks.bind(this));
+    }
+
     clearCondition(name, newCallback = null, deps = []) {
         if (!this.isSet(name)) {
             throw new Error('clearCondition called on unset condition');
@@ -234,6 +244,7 @@ function callMain() {
 
 var emloop_init_fs;
 var emloop_install_pack;
+var emloop_remove_pack;
 var emloop_set_conf;
 var emloop_invoke_main;
 var irrlicht_resize;
@@ -245,7 +256,8 @@ var emsocket_set_vpn;
 function emloop_ready() {
     emloop_init_fs = cwrap("emloop_init_fs", null, ["number"]);
     emloop_install_pack = cwrap("emloop_install_pack", null, ["number", "number", "number", "number"]);
-    emloop_set_conf = cwrap("emloop_set_conf", null, ["number"]);
+    emloop_remove_pack = cwrap("emloop_remove_pack", null, ["number"]);
+    emloop_set_conf = cwrap("emloop_set_conf", null, ["number", "number"]);
     emloop_invoke_main = cwrap("emloop_invoke_main", null, ["number", "number"]);
     irrlicht_resize = cwrap("irrlicht_resize", null, ["number", "number"]);
     emsocket_init = cwrap("emsocket_init", null, []);
@@ -283,9 +295,32 @@ function emloop_pack_progress(name, fraction) {
 
 // Called by the wasm module once a pack has finished unpacking.
 function emloop_pack_installed(name) {
-    if (mtLauncher && mtLauncher.onprogress) {
+    if (!mtLauncher) {
+        return;
+    }
+    if (mtLauncher.onprogress) {
         mtLauncher.onprogress(`install:${name}`, 1.0);
     }
+    mtLauncher.notePackInstalled(name);
+}
+
+// Called by the wasm module while a pack is being deleted.
+function emloop_pack_remove_progress(name, fraction) {
+    if (mtLauncher && mtLauncher.onprogress) {
+        mtLauncher.onprogress(`remove:${name}`, fraction);
+    }
+}
+
+// Called by the wasm module once a pack has been deleted, or once it turned
+// out there was nothing to delete.
+function emloop_pack_removed(name, ok) {
+    if (!mtLauncher) {
+        return;
+    }
+    if (ok && mtLauncher.onprogress) {
+        mtLauncher.onprogress(`remove:${name}`, 1.0);
+    }
+    mtLauncher.notePackRemoved(name, ok != 0);
 }
 
 function makeArgv(args) {
@@ -654,6 +689,18 @@ const PACK_DB_DIR = 'luanti/.packs';
 // must be unpacked on every run.
 const VOLATILE_PACKS = new Set(['certs']);
 
+// A minetest.conf key and value as the module's parser reads them: one line
+// each, and nothing that would look like the start of another entry.
+function confPair(key, value) {
+    key = key.toString().trim();
+    value = value.toString();
+    if (key === '' || key.includes('=') || key[0] === '#' ||
+            /[\r\n]/.test(key) || /[\r\n]/.test(value)) {
+        throw new Error(`Invalid minetest.conf entry: ${key}`);
+    }
+    return [key, value];
+}
+
 // A pack name becomes part of a URL and of a file name. Keep it boring.
 // Mirrors validPackName() in mainloop.cpp.
 function validPackName(name) {
@@ -711,6 +758,47 @@ async function openStorageRoot() {
     return root;
 }
 
+// What a pack URL says about the contents it serves. Pack paths carry the
+// release id and are served immutable, so the path identifies the contents.
+// The origin is left out, so that a pack stays installed when the same release
+// is later fetched from a different mirror.
+function packVersion(packUrl) {
+    try {
+        return new URL(packUrl, window.location.href).pathname;
+    } catch (err) {
+        return packUrl;
+    }
+}
+
+// The packs recorded as installed, as [{name, version}] sorted by name, or
+// null if the pack database cannot be read.
+async function readInstalledPacks(root) {
+    let entries;
+    try {
+        const dir = await opfsGetDirectory(root, PACK_DB_DIR, false);
+        entries = await opfsListNames(dir);
+    } catch (err) {
+        return null;
+    }
+    const packs = [];
+    for (const entry of entries) {
+        // Only `.ver` is written once an install has fully succeeded.
+        if (!entry.endsWith('.ver')) {
+            continue;
+        }
+        const name = entry.slice(0, -'.ver'.length);
+        if (!validPackName(name)) {
+            continue;
+        }
+        const version = await readPackVersion(root, name);
+        if (version !== null) {
+            packs.push({name: name, version: version});
+        }
+    }
+    packs.sort((a, b) => (a.name < b.name) ? -1 : ((a.name > b.name) ? 1 : 0));
+    return packs;
+}
+
 // The version of `name` recorded by a previous run, or null if it is not
 // installed. Written by emloop_install_pack once unpacking succeeded.
 async function readPackVersion(root, name) {
@@ -750,6 +838,10 @@ class LuantiLauncher {
         this.onerror = null; // function(message)
         this.onprint = null; // function(text)
         this.addedPacks = new Set();
+        // pack name -> a promise settled once the module has unpacked it.
+        this.packInstalls = new Map();
+        // pack name -> a promise settled once the module has deleted it.
+        this.packRemovals = new Map();
         this.vpn = null;
         this.serverCode = null;
         this.clientCode = null;
@@ -757,6 +849,7 @@ class LuantiLauncher {
         this.packsDir = DEFAULT_PACKS_DIR;
         this.packsDirIsCors = false;
         this.conf = new Map();
+        this.confOverrides = new Map();
         // 'auto' | 'memory'
         this.storageMode = getDefaultStorage();
         // Set once the OPFS probe finishes / once the wasm module has mounted.
@@ -787,6 +880,60 @@ class LuantiLauncher {
     // Only meaningful after 'onready'.
     isPersistent() {
         return this.storageActive;
+    }
+
+    // The packs left in persistent storage by this or an earlier visit, as
+    // [{name, version}] sorted by name. Empty without persistent storage,
+    // since nothing outlives the page then.
+    //
+    // This waits for the module to mount /luanti, so it resolves no earlier
+    // than 'onready'.
+    async listInstalledPacks() {
+        await this.#storageProbe;
+        if (!this.storageAvailable || !(await mtFsActive)) {
+            return [];
+        }
+        return (await readInstalledPacks(this.storageRoot)) || [];
+    }
+
+    // The version the current packs directory would install for `name`. A pack
+    // recorded under a different version is out of date, and adding it again
+    // replaces what is installed.
+    availablePackVersion(name) {
+        return packVersion(this.packsDir + '/' + name + '.pack');
+    }
+
+    // Take `name` back out of persistent storage: everything it installed is
+    // deleted, and it stops counting as installed. Worlds and anything the
+    // player installed themselves are not part of a pack, and stay.
+    //
+    // The module does the deleting, because /luanti is mounted there: deleting
+    // underneath the mount from here would leave it still seeing the files.
+    // How far along it is arrives through onprogress as `remove:<name>`.
+    async removePack(name) {
+        if (mtScheduler.isSet("launch_called")) {
+            throw new Error("Cannot remove packs after launch");
+        }
+        if (!validPackName(name)) {
+            throw new Error(`Invalid pack name: ${name}`);
+        }
+        await this.#storageProbe;
+        // Waiting on the mount also waits for the module to be callable.
+        if (!this.storageAvailable || !(await mtFsActive)) {
+            throw new Error("There is no persistent storage to remove from");
+        }
+        const removal = this.#packRemoval(name);
+        const namePtr = stringToNewUTF8(name);
+        emloop_remove_pack(namePtr);
+        _free(namePtr);
+        if (!(await removal.promise)) {
+            throw new Error(`Could not remove ${name}`);
+        }
+        // Adding it again has to download and unpack it afresh.
+        this.addedPacks.delete(name);
+        this.packInstalls.delete(name);
+        mtScheduler.removeCondition("fetched:" + name);
+        mtScheduler.removeCondition("installed:" + name);
     }
 
     // Ask the browser not to evict the saved worlds. Chrome decides silently
@@ -837,14 +984,22 @@ class LuantiLauncher {
     // These are applied as defaults: with persistent storage a key the player
     // has since changed in-game keeps its saved value.
     setConf(key, value) {
-        key = key.toString();
-        value = value.toString();
-        this.conf.set(key, value);
+        const [k, v] = confPair(key, value);
+        this.conf.set(k, v);
     }
 
-    #renderConf() {
+    // Set a key/value pair in minetest.conf, replacing what is saved there.
+    //
+    // For the settings the launcher is the authority on rather than the
+    // player, such as which game the main menu should open with.
+    overrideConf(key, value) {
+        const [k, v] = confPair(key, value);
+        this.confOverrides.set(k, v);
+    }
+
+    #renderConf(conf) {
         let lines = [];
-        for (const [k, v] of this.conf.entries()) {
+        for (const [k, v] of conf.entries()) {
             lines.push(`${k} = ${v}\n`);
         }
         return lines.join('');
@@ -877,24 +1032,67 @@ class LuantiLauncher {
         }
     }
 
+    // The promise for `name`, created on first use. Settled by
+    // notePackInstalled() once the pack is usable.
+    #packInstall(name) {
+        let entry = this.packInstalls.get(name);
+        if (!entry) {
+            entry = {};
+            entry.promise = new Promise((resolve) => { entry.resolve = resolve; });
+            this.packInstalls.set(name, entry);
+        }
+        return entry;
+    }
+
+    // Internal. Called once `name` has been unpacked, or once it turned out
+    // that persistent storage already holds it.
+    notePackInstalled(name) {
+        this.#packInstall(name).resolve();
+    }
+
+    // The promise for the removal of `name`, created when one is asked for.
+    // Unlike an install, a pack can be removed more than once, so the promise
+    // only lasts as long as the removal it belongs to.
+    #packRemoval(name) {
+        const entry = {};
+        entry.promise = new Promise((resolve) => { entry.resolve = resolve; });
+        this.packRemovals.set(name, entry);
+        return entry;
+    }
+
+    // Internal. Called once the module is done deleting `name`, with whether
+    // there was anything there to delete.
+    notePackRemoved(name, ok) {
+        const entry = this.packRemovals.get(name);
+        if (entry) {
+            this.packRemovals.delete(name);
+            entry.resolve(ok);
+        }
+    }
+
+    // Download `name` and unpack it into /luanti. With persistent storage a
+    // pack that is already there is left alone and not downloaded again.
+    //
+    // Resolves once the pack is installed and ready to be used, and rejects if
+    // it could not be downloaded.
     async addPack(name) {
         if (mtScheduler.isSet("launch_called")) {
             throw new Error("Cannot add packs after launch");
         }
         if (this.addedPacks.has(name))
-            return;
+            return this.#packInstall(name).promise;
         if (!validPackName(name)) {
             throw new Error(`Invalid pack name: ${name}`);
         }
         this.addedPacks.add(name);
+        const installDone = this.#packInstall(name).promise;
 
         const fetchedCond = "fetched:" + name;
         const installedCond = "installed:" + name;
         const packUrl = this.packsDir + '/' + name + '.pack';
-        // Pack URLs carry the release id and are served immutable, so the URL
-        // identifies the contents. A pack recorded under this version in
-        // persistent storage is already unpacked, and is left alone.
-        const version = VOLATILE_PACKS.has(name) ? '' : packUrl;
+        // A pack recorded under this version in persistent storage is
+        // already unpacked, and is left alone.
+        const version = VOLATILE_PACKS.has(name) ? '' : this.availablePackVersion(name);
 
         let chunks = [];
         let received = 0;
@@ -909,6 +1107,9 @@ class LuantiLauncher {
                     this.onprogress(`download:${name}`, 1.0);
                     this.onprogress(`install:${name}`, 1.0);
                 }
+                // The module is never asked to unpack it, so it will not be
+                // the one to report the pack as installed.
+                this.notePackInstalled(name);
                 return;
             }
             // Install
@@ -945,14 +1146,23 @@ class LuantiLauncher {
                 consolePrint(`Pack ${name} is already installed`);
                 alreadyInstalled = true;
                 mtScheduler.setCondition(fetchedCond);
-                return;
+                return installDone;
             }
         }
 
         let resp;
         try {
             resp = await fetch(packUrl, this.packsDirIsCors ? { credentials: 'omit' } : {});
+            if (!resp.ok) {
+                // Whatever the server sent instead is not a pack.
+                throw new Error(`${packUrl}: HTTP ${resp.status}`);
+            }
         } catch (err) {
+            // Leave nothing waiting on a pack that is not coming, so that the
+            // rest of the page keeps working and adding it again retries.
+            this.addedPacks.delete(name);
+            mtScheduler.removeCondition(fetchedCond);
+            mtScheduler.removeCondition(installedCond);
             if (this.onerror) {
                 this.onerror(`${err}`);
             } else {
@@ -982,6 +1192,7 @@ class LuantiLauncher {
             }
         }
         mtScheduler.setCondition(fetchedCond);
+        return installDone;
     }
 
     // Launch luanti.exe <args>
@@ -1013,12 +1224,16 @@ class LuantiLauncher {
         }
         activateBody();
         fixGeometry();
-        if (this.conf.size > 0) {
-            const contents = this.#renderConf();
-            console.log("minetest.conf is: ", contents);
-            const confBuf = stringToNewUTF8(contents);
-            emloop_set_conf(confBuf);
-            _free(confBuf);
+        if (this.conf.size > 0 || this.confOverrides.size > 0) {
+            const defaults = this.#renderConf(this.conf);
+            const overrides = this.#renderConf(this.confOverrides);
+            console.log("minetest.conf defaults: ", defaults);
+            console.log("minetest.conf overrides: ", overrides);
+            const defaultsBuf = stringToNewUTF8(defaults);
+            const overridesBuf = stringToNewUTF8(overrides);
+            emloop_set_conf(defaultsBuf, overridesBuf);
+            _free(defaultsBuf);
+            _free(overridesBuf);
         }
         // Setup emsocket
         // TODO: emsocket should export the helpers for this
