@@ -856,10 +856,11 @@ class LuantiLauncher {
         this.storageRoot = null;
         this.storageAvailable = false;
         this.storageActive = false;
+
+        mtScheduler.addCondition("storageProbed");
         this.#storageProbe = this.#probeStorage();
 
         mtScheduler.addCondition("wasmReady", loadWasm);
-        mtScheduler.addCondition("storageProbed");
         mtScheduler.addCondition("fsReady", initFs, ['wasmReady', 'storageProbed']);
         mtScheduler.addCondition("launch_called");
         mtScheduler.addCondition("ready", this.#notifyReady.bind(this), ['fsReady']);
