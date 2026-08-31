@@ -242,6 +242,9 @@
           tcon_print("", "READY!");
           enableLaunchForm();
       };
+      mtl.onexit = (status) => {
+          tcon_print("", `Luanti exited with status ${status}. Reload to play again.`);
+      };
       mtl.onerror = (err) => {
           tcon_print("", "**************** FATAL ERROR ******************");
           tcon_print("", err);

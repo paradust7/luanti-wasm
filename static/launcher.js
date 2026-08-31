@@ -157,6 +157,9 @@ function updateProgressBar(doneBytes, neededBytes) {
 // Singleton
 var mtLauncher = null;
 
+// Set once main() has returned. See emloop_exited().
+var mtExited = false;
+
 class LaunchScheduler {
     constructor() {
         this.conditions = new Map();
@@ -360,6 +363,14 @@ function emloop_world_deleted(dir, ok) {
 function emloop_zip_progress(dir, fraction) {
     if (mtLauncher && mtLauncher.onprogress) {
         mtLauncher.onprogress(`zip:${dir}`, fraction);
+    }
+}
+
+// Called when main() has returned.
+function emloop_exited(status) {
+    mtExited = true;
+    if (mtLauncher && mtLauncher.onexit) {
+        mtLauncher.onexit(status);
     }
 }
 
@@ -625,8 +636,12 @@ function setupEscapeHandlers() {
         sendEscapeKey();
     });
 
-    // Force confirmation before leaving page
-    window.addEventListener('beforeunload', (e) => { e.preventDefault(); });
+    // Force confirmation if the game is still running.
+    window.addEventListener('beforeunload', (e) => {
+        if (!mtExited) {
+            e.preventDefault();
+        }
+    });
 }
 
 function sendEscapeKey() {
@@ -1000,6 +1015,7 @@ class LuantiLauncher {
         this.onready = null; // function()
         this.onerror = null; // function(message)
         this.onprint = null; // function(text)
+        this.onexit = null; // function(status) when main() returns
         this.addedPacks = new Set();
         // pack name -> a promise settled once the module has unpacked it.
         this.packInstalls = new Map();
