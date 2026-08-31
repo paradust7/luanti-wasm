@@ -245,6 +245,9 @@ function callMain() {
 var emloop_init_fs;
 var emloop_install_pack;
 var emloop_remove_pack;
+var emloop_disk_usage;
+var emloop_delete_world;
+var emloop_zip_world;
 var emloop_set_conf;
 var emloop_invoke_main;
 var irrlicht_resize;
@@ -257,6 +260,9 @@ function emloop_ready() {
     emloop_init_fs = cwrap("emloop_init_fs", null, ["number"]);
     emloop_install_pack = cwrap("emloop_install_pack", null, ["number", "number", "number", "number"]);
     emloop_remove_pack = cwrap("emloop_remove_pack", null, ["number"]);
+    emloop_disk_usage = cwrap("emloop_disk_usage", null, ["number", "number"]);
+    emloop_delete_world = cwrap("emloop_delete_world", null, ["number"]);
+    emloop_zip_world = cwrap("emloop_zip_world", null, ["number"]);
     emloop_set_conf = cwrap("emloop_set_conf", null, ["number", "number"]);
     emloop_invoke_main = cwrap("emloop_invoke_main", null, ["number", "number"]);
     irrlicht_resize = cwrap("irrlicht_resize", null, ["number", "number"]);
@@ -321,6 +327,56 @@ function emloop_pack_removed(name, ok) {
         mtLauncher.onprogress(`remove:${name}`, 1.0);
     }
     mtLauncher.notePackRemoved(name, ok != 0);
+}
+
+// Called by the wasm module with how much space something takes up, in bytes.
+// A negative count means there was nothing to measure.
+function emloop_usage_result(kind, name, bytes) {
+    if (mtLauncher) {
+        mtLauncher.noteUsage(kind, name, (bytes >= 0) ? bytes : null);
+    }
+}
+
+// Called by the wasm module while a world is being deleted.
+function emloop_world_delete_progress(dir, fraction) {
+    if (mtLauncher && mtLauncher.onprogress) {
+        mtLauncher.onprogress(`delete:${dir}`, fraction);
+    }
+}
+
+// Called by the wasm module once a world has been deleted, or once it turned
+// out there was nothing to delete.
+function emloop_world_deleted(dir, ok) {
+    if (!mtLauncher) {
+        return;
+    }
+    if (ok && mtLauncher.onprogress) {
+        mtLauncher.onprogress(`delete:${dir}`, 1.0);
+    }
+    mtLauncher.noteWorldDeleted(dir, ok != 0);
+}
+
+// Called by the wasm module while a world is being packed into a zip.
+function emloop_zip_progress(dir, fraction) {
+    if (mtLauncher && mtLauncher.onprogress) {
+        mtLauncher.onprogress(`zip:${dir}`, fraction);
+    }
+}
+
+// Called by the wasm module once a world has been zipped. Null means error.
+function emloop_world_zipped(dir, ptr, size) {
+    if (!mtLauncher) {
+        return;
+    }
+    let blob = null;
+    if (ptr) {
+        // The memory belongs to the caller, so make a copy.
+        blob = new Blob([HEAPU8.slice(ptr, ptr + size)], {type: 'application/zip'});
+        if (mtLauncher.onprogress) {
+            mtLauncher.onprogress(`zip:${dir}`, 1.0);
+        }
+    }
+    mtLauncher.noteWorldZipped(dir, blob);
 }
 
 function makeArgv(args) {
@@ -598,6 +654,7 @@ class LuantiArgs {
         this.gameid = '';
         this.address = '';
         this.port = '';
+        this.world = '';
         this.packs = [];
         this.extra = [];
     }
@@ -611,6 +668,7 @@ class LuantiArgs {
         if (this.gameid) args.push('--gameid', this.gameid);
         if (this.address) args.push('--address', this.address);
         if (this.port) args.push('--port', this.port.toString());
+        if (this.world) args.push('--world', this.world);
         args.push(...this.extra);
         return args;
     }
@@ -624,6 +682,7 @@ class LuantiArgs {
         if (this.gameid) params.append('gameid', this.gameid);
         if (this.address) params.append('address', this.address);
         if (this.port) params.append('port', this.port.toString());
+        if (this.world) params.append('world', this.world);
         const extra_packs = [];
         this.packs.forEach(v => {
             if (v != 'base' && v != this.gameid) {
@@ -649,6 +708,7 @@ class LuantiArgs {
         if (params.has('gameid')) r.gameid = params.get('gameid');
         if (params.has('address')) r.address = params.get('address');
         if (params.has('port')) r.port = parseInt(params.get('port'));
+        if (params.has('world')) r.world = params.get('world');
         if (r.gameid && r.gameid != 'base') {
             r.packs.push(r.gameid);
         }
@@ -684,10 +744,21 @@ class LuantiArgs {
 // Mirrors PACK_DB_DIR in mainloop.cpp.
 const PACK_DB_DIR = 'luanti/.packs';
 
+// Where Luanti keeps its worlds. The build runs in place, so path_user is the
+// Luanti root and this is the only place getAvailableWorlds() looks.
+const WORLDS_DIR = 'luanti/worlds';
+const WORLDS_PATH = '/' + WORLDS_DIR;
+
 // These packs install outside /luanti (the CA certificate bundle lands in
 // /etc/ssl/certs, which is always in memory), so they cannot be remembered and
 // must be unpacked on every run.
 const VOLATILE_PACKS = new Set(['certs']);
+
+// These packs are part of the release rather than the content: they are built
+// alongside luanti.wasm and only make sense with it, so they always come from
+// the directory the release was published in, whatever packs directory the
+// page has since picked out for games.
+const RELEASE_PACKS = new Set(['base', 'certs']);
 
 // A minetest.conf key and value as the module's parser reads them: one line
 // each, and nothing that would look like the start of another entry.
@@ -799,6 +870,98 @@ async function readInstalledPacks(root) {
     return packs;
 }
 
+// The worlds saved in `root`, as [{dir, path, name, gameid, mtime}] sorted by
+// name.
+//
+// A world is a directory under worlds/ holding a world.mt, which says what game
+// it belongs to and, if the player renamed it, what to call it. Worlds without
+// one are old enough that Luanti has to guess at the game, and are left out.
+// Mirrors getAvailableWorlds() in subgames.cpp.
+async function readWorlds(root) {
+    let dir, names;
+    try {
+        dir = await opfsGetDirectory(root, WORLDS_DIR, false);
+        names = await opfsListNames(dir);
+    } catch (err) {
+        return [];
+    }
+    const worlds = [];
+    for (const name of names) {
+        let worldDir, conf;
+        try {
+            worldDir = await dir.getDirectoryHandle(name, { create: false });
+            const handle = await worldDir.getFileHandle('world.mt');
+            conf = parseConf(await (await handle.getFile()).text());
+        } catch (err) {
+            // A file, or a directory that is not a world.
+            continue;
+        }
+        const gameid = conf.get('gameid');
+        if (!gameid) {
+            continue;
+        }
+        worlds.push({
+            dir: name,
+            path: WORLDS_PATH + '/' + name,
+            name: conf.get('world_name') || name,
+            gameid: gameid,
+            mtime: await newestFileTime(worldDir),
+        });
+    }
+    worlds.sort((a, b) => (a.name < b.name) ? -1 : ((a.name > b.name) ? 1 : 0));
+    return worlds;
+}
+
+// When anything directly inside `dir` was last written, in milliseconds since
+// the epoch, or 0 if that cannot be told. A world's map and player databases
+// are only written while it is being served, so for a world directory this is
+// near enough to when it was last played.
+async function newestFileTime(dir) {
+    let newest = 0;
+    let names;
+    try {
+        names = await opfsListNames(dir);
+    } catch (err) {
+        return 0;
+    }
+    for (const name of names) {
+        try {
+            const file = await (await dir.getFileHandle(name)).getFile();
+            if (file.lastModified > newest) {
+                newest = file.lastModified;
+            }
+        } catch (err) {
+            // A subdirectory rather than a file. Nothing to read a time from.
+        }
+    }
+    return newest;
+}
+
+// The `key = value` pairs in a Luanti config file, as a Map. Comments and the
+// group syntax the settings menu writes are skipped over rather than parsed:
+// nothing this reads for is ever written as a group.
+function parseConf(text) {
+    const conf = new Map();
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        const eq = line.indexOf('=');
+        if (line === '' || line[0] === '#' || eq < 0) {
+            continue;
+        }
+        const key = line.slice(0, eq).trim();
+        const value = line.slice(eq + 1).trim();
+        if (value === '"""') {
+            // A multi-line value. Its lines are not keys, so skip past them.
+            while (++i < lines.length && lines[i].trim() !== '"""') {
+            }
+            continue;
+        }
+        conf.set(key, value);
+    }
+    return conf;
+}
+
 // The version of `name` recorded by a previous run, or null if it is not
 // installed. Written by emloop_install_pack once unpacking succeeded.
 async function readPackVersion(root, name) {
@@ -842,6 +1005,12 @@ class LuantiLauncher {
         this.packInstalls = new Map();
         // pack name -> a promise settled once the module has deleted it.
         this.packRemovals = new Map();
+        // 'kind:name' -> a promise settled once the module has measured it.
+        this.usageQueries = new Map();
+        // world directory -> a promise settled once the module has deleted it.
+        this.worldDeletions = new Map();
+        // world directory -> a promise settled once the module has packed it.
+        this.worldZips = new Map();
         this.vpn = null;
         this.serverCode = null;
         this.clientCode = null;
@@ -897,11 +1066,29 @@ class LuantiLauncher {
         return (await readInstalledPacks(this.storageRoot)) || [];
     }
 
+    // The worlds saved in persistent storage, as [{dir, path, name, gameid}]
+    // sorted by name. Empty without persistent storage, since a world made
+    // then only lives as long as the page does.
+    //
+    // Like listInstalledPacks(), this resolves no earlier than 'onready'.
+    async listWorlds() {
+        await this.#storageProbe;
+        if (!this.storageAvailable || !(await mtFsActive)) {
+            return [];
+        }
+        return await readWorlds(this.storageRoot);
+    }
+
     // The version the current packs directory would install for `name`. A pack
     // recorded under a different version is out of date, and adding it again
     // replaces what is installed.
     availablePackVersion(name) {
-        return packVersion(this.packsDir + '/' + name + '.pack');
+        return packVersion(this.#packsDirFor(name) + '/' + name + '.pack');
+    }
+
+    // The directory `name` is served from.
+    #packsDirFor(name) {
+        return RELEASE_PACKS.has(name) ? DEFAULT_PACKS_DIR : this.packsDir;
     }
 
     // Take `name` back out of persistent storage: everything it installed is
@@ -935,6 +1122,127 @@ class LuantiLauncher {
         this.packInstalls.delete(name);
         mtScheduler.removeCondition("fetched:" + name);
         mtScheduler.removeCondition("installed:" + name);
+    }
+
+    // How much space `name` is taking up in persistent storage, in bytes, or
+    // null if that cannot be told. `kind` is 'pack' for an installed pack,
+    // which counts only what the pack itself laid down, or 'world' for a saved
+    // world, which counts everything in it.
+    //
+    // The module does the adding up, on the worker that runs main(). Walking a
+    // whole tree from the page would mean a round trip to the OPFS worker for
+    // every single file, and the page would be sitting still throughout.
+    async diskUsage(kind, name) {
+        await this.#storageProbe;
+        if (!this.storageAvailable || !(await mtFsActive)) {
+            return null;
+        }
+        // After launch the module is running the game and no longer answering.
+        if (mtScheduler.isSet("launch_called")) {
+            return null;
+        }
+        const key = `${kind}:${name}`;
+        const existing = this.usageQueries.get(key);
+        if (existing) {
+            return existing.promise;
+        }
+        const entry = {};
+        entry.promise = new Promise((resolve) => { entry.resolve = resolve; });
+        this.usageQueries.set(key, entry);
+        const kindPtr = stringToNewUTF8(kind);
+        const namePtr = stringToNewUTF8(name);
+        emloop_disk_usage(kindPtr, namePtr);
+        _free(kindPtr);
+        _free(namePtr);
+        return entry.promise;
+    }
+
+    // Internal. Called once the module has measured something.
+    noteUsage(kind, name, bytes) {
+        const key = `${kind}:${name}`;
+        const entry = this.usageQueries.get(key);
+        if (entry) {
+            this.usageQueries.delete(key);
+            entry.resolve(bytes);
+        }
+    }
+
+    // Delete the saved world in the `dir` directory, and everything in it.
+    // There is no undoing this, and no copy anywhere else.
+    //
+    // The module does the deleting, for the same reason it does the deleting
+    // of a pack: /luanti is mounted there. How far along it is arrives through
+    // onprogress as `delete:<dir>`.
+    async deleteWorld(dir) {
+        if (mtScheduler.isSet("launch_called")) {
+            throw new Error("Cannot delete worlds after launch");
+        }
+        await this.#storageProbe;
+        if (!this.storageAvailable || !(await mtFsActive)) {
+            throw new Error("There is no persistent storage to delete from");
+        }
+        if (this.worldDeletions.has(dir)) {
+            throw new Error(`Already deleting ${dir}`);
+        }
+        const entry = {};
+        entry.promise = new Promise((resolve) => { entry.resolve = resolve; });
+        this.worldDeletions.set(dir, entry);
+        const dirPtr = stringToNewUTF8(dir);
+        emloop_delete_world(dirPtr);
+        _free(dirPtr);
+        if (!(await entry.promise)) {
+            throw new Error(`Could not delete ${dir}`);
+        }
+    }
+
+    // Internal. Called once the module is done deleting `dir`, with whether
+    // there was anything there to delete.
+    noteWorldDeleted(dir, ok) {
+        const entry = this.worldDeletions.get(dir);
+        if (entry) {
+            this.worldDeletions.delete(dir);
+            entry.resolve(ok);
+        }
+    }
+
+    // Pack the saved world in the `dir` directory into a zip archive, and
+    // resolve to it as a Blob for the page to hand to the player.
+    //
+    // Reading and compressing happen in the module, which is the only place
+    // that can read the world without a round trip per file. How far along it
+    // is arrives through onprogress as `zip:<dir>`.
+    async zipWorld(dir) {
+        if (mtScheduler.isSet("launch_called")) {
+            throw new Error("Cannot pack worlds after launch");
+        }
+        await this.#storageProbe;
+        if (!this.storageAvailable || !(await mtFsActive)) {
+            throw new Error("There is no persistent storage to read from");
+        }
+        if (this.worldZips.has(dir)) {
+            throw new Error(`Already packing ${dir}`);
+        }
+        const entry = {};
+        entry.promise = new Promise((resolve) => { entry.resolve = resolve; });
+        this.worldZips.set(dir, entry);
+        const dirPtr = stringToNewUTF8(dir);
+        emloop_zip_world(dirPtr);
+        _free(dirPtr);
+        const blob = await entry.promise;
+        if (!blob) {
+            throw new Error(`Could not pack ${dir}`);
+        }
+        return blob;
+    }
+
+    // Internal. Called once the module is done packing `dir`, with the archive
+    // or with null if it could not be made.
+    noteWorldZipped(dir, blob) {
+        const entry = this.worldZips.get(dir);
+        if (entry) {
+            this.worldZips.delete(dir);
+            entry.resolve(blob);
+        }
     }
 
     // Ask the browser not to evict the saved worlds. Chrome decides silently
@@ -1090,7 +1398,9 @@ class LuantiLauncher {
 
         const fetchedCond = "fetched:" + name;
         const installedCond = "installed:" + name;
-        const packUrl = this.packsDir + '/' + name + '.pack';
+        const packUrl = this.#packsDirFor(name) + '/' + name + '.pack';
+        // A release pack is served from the page's own origin.
+        const isCors = this.packsDirIsCors && !RELEASE_PACKS.has(name);
         // A pack recorded under this version in persistent storage is
         // already unpacked, and is left alone.
         const version = VOLATILE_PACKS.has(name) ? '' : this.availablePackVersion(name);
@@ -1153,7 +1463,7 @@ class LuantiLauncher {
 
         let resp;
         try {
-            resp = await fetch(packUrl, this.packsDirIsCors ? { credentials: 'omit' } : {});
+            resp = await fetch(packUrl, isCors ? { credentials: 'omit' } : {});
             if (!resp.ok) {
                 // Whatever the server sent instead is not a pack.
                 throw new Error(`${packUrl}: HTTP ${resp.status}`);

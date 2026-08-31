@@ -6,8 +6,10 @@ unpack_source libarchive
 
 pushd "$BUILD_DIR/libarchive"
 
-export CPPFLAGS="${CPPFLAGS-} -I${INSTALL_DIR}/include"
-export LDFLAGS="$LDFLAGS -L${INSTALL_DIR}/lib"
+# zlib for compressed .zip support
+export CPPFLAGS="${CPPFLAGS-} -I${INSTALL_DIR}/include --use-port=zlib"
+export CFLAGS="$CFLAGS --use-port=zlib"
+export LDFLAGS="$LDFLAGS -L${INSTALL_DIR}/lib --use-port=zlib"
 emconfigure ./configure \
   --enable-static \
   --disable-shared \
