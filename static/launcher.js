@@ -10,6 +10,8 @@ body {
   margin: 0;
   padding: none;
   background-color: black;
+  /* Make sure scrollbar never appears */
+  overflow: hidden;
 }
 
 .emscripten {
@@ -31,10 +33,67 @@ canvas.emscripten {
   background-color: black;
 }
 
-#controls {
-  display: inline-block;
-  vertical-align: top;
-	height: 25px;
+/* Always painted over the canvas, top right corner. */
+#console_panel {
+  position: fixed;
+  top: 8px;
+  right: 8px;
+  z-index: 20;
+  background-color: white;
+  padding: 0;
+  line-height: 0;
+}
+
+#console_button {
+  display: block;
+  width: 28px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  /* Suppress the native button chrome, which draws its own light border */
+  appearance: none;
+  -webkit-appearance: none;
+  /* Fill the button exactly, so no panel background shows around the icon */
+  background: url('${RELEASE_DIR}/term_icon.png') center / 100% 100% no-repeat white;
+  cursor: pointer;
+}
+
+/* When shown, the console docks to the right of the canvas.
+   Its width is set by dragging #console_splitter. */
+#console_dock {
+  position: fixed;
+  top: 0;
+  right: 0;
+  height: 100%;
+  z-index: 10;
+  background-color: black;
+}
+
+#console_splitter {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 6px;
+  height: 100%;
+  background-color: #555555;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+#console_splitter:hover {
+  background-color: #888888;
+}
+
+#console_output {
+  position: absolute;
+  top: 0;
+  left: 6px;
+  right: 0;
+  width: auto;
+  height: 100%;
+  box-sizing: border-box;
+  border: 0px none;
+  resize: none;
 }
 
 .console {
@@ -57,28 +116,6 @@ const rtHTML = `
   <div id="header">
 
   <div class="emscripten">
-    <span id="controls">
-      <span>
-        <select id="resolution" onchange="fixGeometry()">
-          <option value="high">High Res</option>
-          <option value="medium">Medium</option>
-          <option value="low">Low Res</option>
-        </select>
-      </span>
-      <span>
-        <select id="aspectRatio" onchange="fixGeometry()">
-          <option value="any">Fit Screen</option>
-          <option value="4:3">4:3</option>
-          <option value="16:9">16:9</option>
-          <option value="5:4">5:4</option>
-          <option value="21:9">21:9</option>
-          <option value="32:9">32:9</option>
-          <option value="1:1">1:1</option>
-        </select>
-      </span>
-      <span><input id="console_button" type="button" value="Show Console" onclick="consoleToggle()"></span>
-      <span>(full screen: try F11 or Command+Shift+F)</span>
-    </span>
     <div id="progressbar_div" style="display: none">
       <progress id="progressbar" value="0" max="100">0%</progress>
     </div>
@@ -89,8 +126,13 @@ const rtHTML = `
   <div class="emscripten" id="canvas_container">
   </div>
 
-  <div id="footer">
-    <textarea id="console_output" class="console" rows="8" style="display: none; height: 200px"></textarea>
+  <div id="console_dock" style="display: none">
+    <div id="console_splitter" title="Drag to resize the console"></div>
+    <textarea id="console_output" class="console" readonly></textarea>
+  </div>
+
+  <div id="console_panel">
+    <input id="console_button" type="button" value="" title="Toggle console" aria-label="Toggle console" onclick="consoleToggle()">
   </div>
 `;
 
@@ -106,7 +148,8 @@ mtCanvas.tabIndex = "-1";
 mtCanvas.width = 1024;
 mtCanvas.height = 600;
 
-var consoleButton;
+var canvasContainer;
+var consoleDock;
 var consoleOutput;
 var progressBar;
 var progressBarDiv;
@@ -125,14 +168,15 @@ function activateBody() {
     mtContainer.innerHTML = rtHTML;
     document.body.appendChild(mtContainer);
 
-    const canvasContainer = document.getElementById('canvas_container');
+    canvasContainer = document.getElementById('canvas_container');
     canvasContainer.appendChild(mtCanvas);
 
     setupResizeHandlers();
     setupEscapeHandlers();
 
-    consoleButton = document.getElementById('console_button');
+    consoleDock = document.getElementById('console_dock');
     consoleOutput = document.getElementById('console_output');
+    setupConsoleSplitter();
     // Triggers the first and all future updates
     consoleUpdate();
 
@@ -417,10 +461,72 @@ function consoleUpdate() {
     window.requestAnimationFrame(consoleUpdate);
 }
 
+// The console docks on the right, sharing the screen with the canvas.
+const CONSOLE_MIN_WIDTH = 150;   // Smallest useful console
+const CONSOLE_MIN_CANVAS = 200;  // Never let the console swallow the whole canvas
+var consoleWidth = 0;
+
+function consoleShown() {
+    return consoleDock && consoleDock.style.display != 'none';
+}
+
+// Sets the console width (in px), clamped to what the screen can give it.
+function setConsoleWidth(width) {
+    const maxWidth = Math.max(CONSOLE_MIN_WIDTH,
+                              document.documentElement.clientWidth - CONSOLE_MIN_CANVAS);
+    consoleWidth = Math.round(Math.min(Math.max(width, CONSOLE_MIN_WIDTH), maxWidth));
+    consoleDock.style.width = `${consoleWidth}px`;
+}
+
 function consoleToggle() {
-    consoleOutput.style.display = (consoleOutput.style.display == 'block') ? 'none' : 'block';
-    consoleButton.value = (consoleOutput.style.display == 'none') ? 'Show Console' : 'Hide Console';
-    fixGeometry();
+    const show = !consoleShown();
+    consoleDock.style.display = show ? 'block' : 'none';
+    // Default to about a third of the screen, then remember the dragged width.
+    setConsoleWidth(consoleWidth || Math.round(document.documentElement.clientWidth / 3));
+    fixGeometry(true);
+}
+
+// Resizing the canvas on every pointermove is expensive, so coalesce into frames.
+var geometryPending = false;
+function scheduleGeometry() {
+    if (geometryPending) {
+        return;
+    }
+    geometryPending = true;
+    window.requestAnimationFrame(() => {
+        geometryPending = false;
+        fixGeometry(true);
+    });
+}
+
+function setupConsoleSplitter() {
+    const splitter = document.getElementById('console_splitter');
+    var dragging = false;
+
+    splitter.addEventListener('pointerdown', (e) => {
+        dragging = true;
+        splitter.setPointerCapture(e.pointerId);
+        e.preventDefault(); // Don't start a text selection
+    });
+
+    splitter.addEventListener('pointermove', (e) => {
+        if (!dragging) {
+            return;
+        }
+        setConsoleWidth(document.documentElement.clientWidth - e.clientX);
+        scheduleGeometry();
+    });
+
+    const stopDrag = (e) => {
+        if (!dragging) {
+            return;
+        }
+        dragging = false;
+        splitter.releasePointerCapture(e.pointerId);
+        fixGeometry(true);
+    };
+    splitter.addEventListener('pointerup', stopDrag);
+    splitter.addEventListener('pointercancel', stopDrag);
 }
 
 var enableTracing = false;
@@ -476,66 +582,42 @@ function fixGeometry(override) {
     if (!override && now() < fixGeometryPause) {
         return;
     }
-    const resolutionSelect = document.getElementById('resolution');
-    const aspectRatioSelect = document.getElementById('aspectRatio');
     var canvas = mtCanvas;
-    var resolution = resolutionSelect.value;
-    var aspectRatio = aspectRatioSelect.value;
     var screenX;
     var screenY;
 
-    // Prevent the controls from getting focus
+    // Prevent other elements from getting focus
     canvas.focus();
+
+    // The console takes its width off the left-hand canvas area.
+    if (consoleShown()) {
+        setConsoleWidth(consoleWidth); // Re-clamp, in case the window shrank
+    }
+    var dockWidth = consoleShown() ? consoleWidth : 0;
 
     var isFullScreen = document.fullscreenElement ? true : false;
     if (isFullScreen) {
-        screenX = screen.width;
+        screenX = screen.width - dockWidth;
         screenY = screen.height;
     } else {
-        // F11-style full screen
-        var controls = document.getElementById('controls');
-        var maximized = !window.screenTop && !window.screenY;
-        controls.style = maximized ? 'display: none' : '';
-
         var headerHeight = document.getElementById('header').offsetHeight;
-        var footerHeight = document.getElementById('footer').offsetHeight;
-        screenX = document.documentElement.clientWidth - 6;
-        screenY = document.documentElement.clientHeight - headerHeight - footerHeight - 6;
+        screenX = document.documentElement.clientWidth - dockWidth;
+        screenY = document.documentElement.clientHeight - headerHeight;
     }
 
     // Size of the viewport (after scaling)
-    var realX;
-    var realY;
-    if (aspectRatio == 'any') {
-        realX = screenX;
-        realY = screenY;
-    } else {
-        var ar = aspectRatio.split(':');
-        var innerRatio = parseInt(ar[0]) / parseInt(ar[1]);
-        var outerRatio = screenX / screenY;
-        if (innerRatio <= outerRatio) {
-            realX = Math.floor(innerRatio * screenY);
-            realY = screenY;
-        } else {
-            realX = screenX;
-            realY = Math.floor(screenX / innerRatio);
-        }
-    }
+    var realX = screenX;
+    var realY = screenY;
+
+    // Keep the canvas in the area left of the console, instead of centered
+    // on the full width (which would put it under the console).
+    canvasContainer.style.width = `${realX}px`;
+    canvasContainer.style.marginLeft = '0';
 
     // Native canvas resolution
-    var resX;
-    var resY;
     var dpr = window.devicePixelRatio || 1;
-    if (resolution == 'high') {
-        resX = Math.floor(dpr * realX);
-        resY = Math.floor(dpr * realY);
-    } else if (resolution == 'medium') {
-        resX = Math.floor(dpr * realX / 1.5);
-        resY = Math.floor(dpr * realY / 1.5);
-    } else {
-        resX = Math.floor(dpr * realX / 2.0);
-        resY = Math.floor(dpr * realY / 2.0);
-    }
+    var resX = Math.floor(dpr * realX);
+    var resY = Math.floor(dpr * realY);
     var styleWidth = realX + "px";
     var styleHeight = realY + "px";
     canvas.style.setProperty("width", styleWidth, "important");
