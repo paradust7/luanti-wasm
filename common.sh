@@ -16,13 +16,13 @@ popd
 case $BUILD_KIND in
   debug)
     export LUANTI_BUILD_TYPE="Debug"
-    export COMMON_CFLAGS="-O0 -g2 -gsource-map"
+    export COMMON_CFLAGS="-O0 -g -gsource-map"
     export COMMON_LDFLAGS="-sSAFE_HEAP=1 -sASSERTIONS=2"
     export BUILD_SUFFIX="-debug"
     ;;
   profile)
     export LUANTI_BUILD_TYPE="Release"
-    export COMMON_CFLAGS="--profiling -O2 -g2 -gsource-map"
+    export COMMON_CFLAGS="--profiling -O2 -g -gsource-map"
     export COMMON_LDFLAGS=""
     export BUILD_SUFFIX="-profile"
     ;;
