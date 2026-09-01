@@ -1,11 +1,15 @@
 var Module = typeof Module != "undefined" ? Module : {};
 
-Module['print'] = (text) => {
-    console.log(text)
-};
+function workerPrint(text) {
+    console.log(text);
+    try {
+        postMessage({ luantiLog: `${text}` });
+    } catch (e) {
+        // The line still reached the javascript console.
+    }
+}
 
-Module['printErr'] = (text) => {
-    console.log(text)
-};
+Module['print'] = workerPrint;
+Module['printErr'] = workerPrint;
 
 importScripts('luanti.js');

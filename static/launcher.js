@@ -4,6 +4,25 @@
 const RELEASE_DIR = '%__RELEASE_UUID__%'; // set by build_www.sh
 const DEFAULT_PACKS_DIR = RELEASE_DIR + '/packs';
 
+// Wrap the constructor of Worker so that every worker thread
+// created by the module can use 'luantiLog' messages to dump
+// output to the console.
+//
+// This is fine because emscripten's own 'message' listener
+// ignores messages that don't have 'cmd'.
+const NativeWorker = Worker;
+globalThis.Worker = class extends NativeWorker {
+    constructor(...args) {
+        super(...args);
+        this.addEventListener('message', (event) => {
+            const msg = event.data;
+            if (msg && msg.luantiLog !== undefined) {
+                consolePrint(msg.luantiLog, false);
+            }
+        });
+    }
+};
+
 const rtCSS = `
 body {
   font-family: arial;
@@ -530,9 +549,14 @@ function setupConsoleSplitter() {
 }
 
 var enableTracing = false;
-function consolePrint(text) {
+
+// All console printing goes through this function.
+// Use 'echo' to avoid double-printing to javascript console.
+function consolePrint(text, echo = true) {
     if (enableTracing) {
         console.trace(text);
+    } else if (echo) {
+        console.log(text);
     }
     consoleText.push(text + "\n");
     consoleDirty = true;
