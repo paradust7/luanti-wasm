@@ -12,7 +12,7 @@ patch -p1 < "$BASE_DIR"/openssl.patch
 
 export CFLAGS="$CFLAGS -I${INSTALL_DIR}/include -DPEDANTIC"
 export CXXFLAGS="$CXXFLAGS -I${INSTALL_DIR}/include -DPEDANTIC"
-export LDFLAGS="$LDFLAGS -L${INSTALL_DIR}/lib -lemsocket"
+export LDFLAGS="$LDFLAGS -L${INSTALL_DIR}/lib -lemsocket -sDEFAULT_TO_CXX"
 
 emconfigure ./Configure linux-generic64 \
   no-asm \

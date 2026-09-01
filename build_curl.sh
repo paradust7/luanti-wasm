@@ -16,7 +16,7 @@ pushd curl-build
 # For emsocket.h
 export CFLAGS="$CFLAGS -I${INSTALL_DIR}/include --use-port=zlib"
 export CXXFLAGS="$CXXFLAGS -I${INSTALL_DIR}/include --use-port=zlib"
-export LDFLAGS="$LDFLAGS -L${INSTALL_DIR}/lib -lemsocket --use-port=zlib"
+export LDFLAGS="$LDFLAGS -L${INSTALL_DIR}/lib -lemsocket -sDEFAULT_TO_CXX --use-port=zlib"
 
 emcmake cmake \
   -DCURL_ZLIB=ON \
