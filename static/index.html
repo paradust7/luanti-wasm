@@ -112,7 +112,15 @@
               opt.innerText = entry[1];
               select_language.appendChild(opt);
           });
+
           select_language.value = getDefaultLanguage();
+          let languageChosen = false;
+          select_language.addEventListener('change', () => { languageChosen = true; });
+          mtl.initialLang().then((lang) => {
+              if (!languageChosen) {
+                  select_language.value = lang;
+              }
+          });
 
           const launch = document.getElementById('launch');
           launch.addEventListener('click', () => {

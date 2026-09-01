@@ -870,6 +870,9 @@ const PACK_DB_DIR = 'luanti/.packs';
 const WORLDS_DIR = 'luanti/worlds';
 const WORLDS_PATH = '/' + WORLDS_DIR;
 
+// Luanti settings file
+const CONF_FILE = 'luanti/minetest.conf';
+
 // These packs install outside /luanti (the CA certificate bundle lands in
 // /etc/ssl/certs, which is always in memory), so they cannot be remembered and
 // must be unpacked on every run.
@@ -1083,6 +1086,26 @@ function parseConf(text) {
     return conf;
 }
 
+// Read the contents of file at `path` (relative to directory handle `root`)
+async function opfsReadFile(root, path) {
+    const cut = path.lastIndexOf('/');
+    try {
+        const dir = await opfsGetDirectory(root, path.slice(0, cut), false);
+        const handle = await dir.getFileHandle(path.slice(cut + 1));
+        return await (await handle.getFile()).text();
+    } catch (err) {
+        return null;
+    }
+}
+
+// The settings a previous run left in minetest.conf, as a Map, or null if
+// there is no readable file. Luanti rewrites this file as the player changes
+// settings in-game, so it is where an in-game choice can be read back.
+async function readSavedConf(root) {
+    const text = await opfsReadFile(root, CONF_FILE);
+    return (text === null) ? null : parseConf(text);
+}
+
 // The version of `name` recorded by a previous run, or null if it is not
 // installed. Written by emloop_install_pack once unpacking succeeded.
 async function readPackVersion(root, name) {
@@ -1199,6 +1222,41 @@ class LuantiLauncher {
             return [];
         }
         return await readWorlds(this.storageRoot);
+    }
+
+    // The language saved in minetest.conf, or null if there is none to read:
+    // no persistent storage, no file yet, or a code this build does not have.
+    //
+    // Unlike listWorlds() this does not wait for the module to mount /luanti,
+    // so that the page can fill in its language selector without waiting for
+    // the wasm module to load. The file is whatever the last run left behind
+    // either way, since mounting does not write it.
+    async savedLang() {
+        await this.#storageProbe;
+        if (!this.storageAvailable) {
+            return null;
+        }
+        const conf = await readSavedConf(this.storageRoot);
+        const lang = conf ? conf.get('language') : null;
+        // Luanti writes an empty value for "whatever the system says", which
+        // is not something the selector can show.
+        return (lang && SUPPORTED_LANGUAGES_MAP.has(lang)) ? lang : null;
+    }
+
+    // What a language selector on the page should start on: the language the
+    // player last played in, so that a change made in-game is carried over,
+    // and otherwise the default for this visit.
+    //
+    // A ?lang= parameter asks for a language for this visit specifically, so
+    // it wins over what was saved.
+    async initialLang() {
+        if (!new URLSearchParams(window.location.search).has("lang")) {
+            const saved = await this.savedLang();
+            if (saved !== null) {
+                return saved;
+            }
+        }
+        return getDefaultLanguage();
     }
 
     // The version the current packs directory would install for `name`. A pack
@@ -1436,11 +1494,12 @@ class LuantiLauncher {
         return lines.join('');
     }
 
+    // Sets language in minetest.conf
     setLang(lang) {
         if (!SUPPORTED_LANGUAGES_MAP.has(lang)) {
             alert(`Invalid code in setLang: ${lang}`);
         }
-        this.setConf("language", lang);
+        this.overrideConf("language", lang);
     }
 
     // Returns pack status:
@@ -1741,9 +1800,18 @@ const SUPPORTED_LANGUAGES = [
 
 const SUPPORTED_LANGUAGES_MAP = new Map(SUPPORTED_LANGUAGES);
 
-function getDefaultLanguage() {
-    const fuzzy = [];
+// The default for this visit, worked out once: the pages ask for it more than
+// once now, and a bad ?lang= parameter is only worth complaining about once.
+let defaultLanguage = null;
 
+function getDefaultLanguage() {
+    if (defaultLanguage === null) {
+        defaultLanguage = findDefaultLanguage();
+    }
+    return defaultLanguage;
+}
+
+function findDefaultLanguage() {
     const url_params = new URLSearchParams(window.location.search);
     if (url_params.has("lang")) {
         const lang = url_params.get("lang");
@@ -1754,6 +1822,7 @@ function getDefaultLanguage() {
         return 'en';
     }
 
+    const fuzzy = [];
     for (let candidate of navigator.languages) {
         candidate = candidate.replaceAll('-', '_');
 
