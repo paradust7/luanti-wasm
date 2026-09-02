@@ -185,7 +185,7 @@
               args.gameid = game;
               args.name = username;
               args.world = world.path;
-              args.address = '127.0.0.1';
+              // --address would make Luanti act like a client instead of a host.
               args.port = 30000;
               args.go = true;
               history.pushState({}, "", `?proxy=${proxyIndex}&game=${game}&join=${clientCode}`);
