@@ -1160,10 +1160,20 @@ async function readPackVersion(root, name) {
     }
 }
 
+// Firefox creates files in persistent storage about ten times slower than
+// other browsers do, and unpacking a game means creating thousands of them,
+// which takes minutes. Firefox forks carry the same engine and the same cost,
+// and they all say Firefox here.
+function isFirefox() {
+    return /Firefox\//.test(navigator.userAgent);
+}
+
 function getDefaultStorage() {
     const params = new URLSearchParams(window.location.search);
     if (!params.has("storage")) {
-        return 'auto';
+        // Persistent storage is unusably slow on Firefox, so nothing is kept
+        // there unless the parameter below asks for it.
+        return isFirefox() ? 'memory' : 'auto';
     }
     const storage = params.get("storage");
     if (storage != 'auto' && storage != 'memory') {
