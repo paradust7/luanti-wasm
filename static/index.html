@@ -30,9 +30,9 @@
       <b>Player Name:</b>
       <input style="border: 2px solid black; width: 400px; height: 2em" type="text" id="multiplayer_username" required="" pattern="[A-Za-z0-9_-]{1,20}" maxlength="19" title="Alphanumeric, 19 characters max">
       <br/>
-      <b>Game:</b>
-      <select id="multiplayer_game">
-          <option value="minetest_game">minetest_game</option>
+      <b>World:</b>
+      <select id="multiplayer_world">
+          <!-- filled by javascript -->
       </select>
       <br/>
       <span>After launch, copy the URL and use it to open clients.</span>
@@ -133,14 +133,44 @@
           });
 
           const launchServer = document.getElementById('launch_server');
+
+          // A server serves one of the worlds already in persistent storage,
+          // and runs whichever game that world belongs to. There is nothing to
+          // serve until Luanti has been run once to make one, so the button
+          // waits until the list has arrived and holds something.
+          const select_world = document.getElementById('multiplayer_world');
+          let worlds = [];
+          launchServer.disabled = true;
+          mtl.listWorlds().then((found) => {
+              worlds = found;
+              if (worlds.length == 0) {
+                  const opt = document.createElement('option');
+                  opt.innerText = 'No saved worlds';
+                  select_world.appendChild(opt);
+                  return;
+              }
+              worlds.forEach((world, index) => {
+                  const opt = document.createElement('option');
+                  opt.value = index;
+                  opt.innerText = `${world.name} (${world.gameid})`;
+                  select_world.appendChild(opt);
+              });
+              launchServer.disabled = false;
+          });
+
           launchServer.addEventListener('click', async () => {
               const proxyIndex = document.getElementById('select_proxy').value;
               const username = document.getElementById('multiplayer_username').value;
-              const game = document.getElementById('multiplayer_game').value;
+              const world = worlds[select_world.value];
               if (username.length == 0) {
                   alert("Empty username");
                   return;
               }
+              if (!world) {
+                  alert("No world selected");
+                  return;
+              }
+              const game = world.gameid;
               wipePage();
 
               const proxy = proxies[proxyIndex][0];
@@ -152,9 +182,9 @@
                   return;
               }
               const args = new LuantiArgs();
-              args.extra.push('--withserver');
               args.gameid = game;
               args.name = username;
+              args.world = world.path;
               args.address = '127.0.0.1';
               args.port = 30000;
               args.go = true;
