@@ -21,4 +21,4 @@ getrepo zstd "https://github.com/facebook/zstd.git" f8745da6ff1ad1e7bab384bd1f9d
 
 # These repos are part of the fork
 getrepo webshims "https://github.com/paradust7/webshims.git" 0767fdedd87f61a28a34f6444b669caf563a9fd5
-getrepo luanti "https://github.com/paradust7/luanti.git" cbccbadbb3f63b7233f08e38bb4b5ec2c0d6561c
+getrepo luanti "https://github.com/paradust7/luanti.git" c1c0b71193787c07c21213958fb19da250b7158a
