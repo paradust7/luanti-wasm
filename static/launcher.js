@@ -314,6 +314,7 @@ var emloop_remove_pack;
 var emloop_disk_usage;
 var emloop_delete_world;
 var emloop_zip_world;
+var emloop_install_zip;
 var emloop_set_conf;
 var emloop_invoke_main;
 var irrlicht_resize;
@@ -329,6 +330,8 @@ function emloop_ready() {
     emloop_disk_usage = cwrap("emloop_disk_usage", null, ["number", "number"]);
     emloop_delete_world = cwrap("emloop_delete_world", null, ["number"]);
     emloop_zip_world = cwrap("emloop_zip_world", null, ["number"]);
+    emloop_install_zip = cwrap("emloop_install_zip", null,
+                               ["number", "number", "number", "number", "number", "number"]);
     emloop_set_conf = cwrap("emloop_set_conf", null, ["number", "number"]);
     emloop_invoke_main = cwrap("emloop_invoke_main", null, ["number", "number"]);
     irrlicht_resize = cwrap("irrlicht_resize", null, ["number", "number"]);
@@ -427,6 +430,28 @@ function emloop_zip_progress(dir, fraction) {
     if (mtLauncher && mtLauncher.onprogress) {
         mtLauncher.onprogress(`zip:${dir}`, fraction);
     }
+}
+
+// Called by the wasm module while a world or game is being installed from a
+// zip. `phase` is 'delete' while what was installed under the same name is
+// being cleared out, and 'install' while the archive is being unpacked.
+function emloop_zip_install_progress(kind, name, phase, fraction) {
+    if (mtLauncher && mtLauncher.onprogress) {
+        mtLauncher.onprogress(
+            `${(phase == 'delete') ? 'wipe' : 'unzip'}:${name}`, fraction);
+    }
+}
+
+// Called by the wasm module once a world or game from a zip is installed, or
+// once it turned out it could not be.
+function emloop_zip_installed(kind, name, ok) {
+    if (!mtLauncher) {
+        return;
+    }
+    if (ok && mtLauncher.onprogress) {
+        mtLauncher.onprogress(`unzip:${name}`, 1.0);
+    }
+    mtLauncher.noteZipInstalled(kind, name, ok != 0);
 }
 
 // Called when main() has returned.
@@ -870,6 +895,9 @@ const PACK_DB_DIR = 'luanti/.packs';
 const WORLDS_DIR = 'luanti/worlds';
 const WORLDS_PATH = '/' + WORLDS_DIR;
 
+// Where Luanti looks for games. Mirrors GAMES_DIR in mainloop.cpp.
+const GAMES_DIR = 'luanti/games';
+
 // Luanti settings file
 const CONF_FILE = 'luanti/minetest.conf';
 
@@ -883,6 +911,13 @@ const VOLATILE_PACKS = new Set(['certs']);
 // the directory the release was published in, whatever packs directory the
 // page has since picked out for games.
 const RELEASE_PACKS = new Set(['base', 'certs']);
+
+// The version recorded for a game installed from a zip, in place of the pack
+// version a downloaded game carries. No pack is ever served under this, which
+// is what says a game is the player's own rather than one of ours: there is
+// nowhere to fetch it from and no newer version of it to offer.
+// Mirrors LOCAL_PACK_VERSION in mainloop.cpp.
+const LOCAL_PACK_VERSION = 'local';
 
 // A minetest.conf key and value as the module's parser reads them: one line
 // each, and nothing that would look like the start of another entry.
@@ -1106,6 +1141,13 @@ async function readSavedConf(root) {
     return (text === null) ? null : parseConf(text);
 }
 
+// What the game `name` says about itself in its game.conf, as a Map, or null
+// if persistent storage holds no such game.
+async function readGameConf(root, name) {
+    const text = await opfsReadFile(root, GAMES_DIR + '/' + name + '/game.conf');
+    return (text === null) ? null : parseConf(text);
+}
+
 // The version of `name` recorded by a previous run, or null if it is not
 // installed. Written by emloop_install_pack once unpacking succeeded.
 async function readPackVersion(root, name) {
@@ -1134,6 +1176,11 @@ function getDefaultStorage() {
 class LuantiLauncher {
     #storageProbe = null;
 
+    // Games installed from a ZIP the player dropped on the page. Persistent
+    // storage remembers these by the version recorded for the pack; this is
+    // what carries one through a visit that is not storing anything.
+    #localPacks = new Set();
+
     constructor() {
         if (mtLauncher !== null) {
             throw new Error("There can be only one launcher");
@@ -1156,6 +1203,9 @@ class LuantiLauncher {
         this.worldDeletions = new Map();
         // world directory -> a promise settled once the module has packed it.
         this.worldZips = new Map();
+        // 'kind:name' -> a promise settled once the module has installed it
+        // from a zip.
+        this.zipInstalls = new Map();
         this.vpn = null;
         this.serverCode = null;
         this.clientCode = null;
@@ -1195,6 +1245,12 @@ class LuantiLauncher {
     // Only meaningful after 'onready'.
     isPersistent() {
         return this.storageActive;
+    }
+
+    // True once launch() has handed the page over to the game. Nothing can be
+    // installed or removed after that: the module is running Luanti.
+    isLaunched() {
+        return mtScheduler.isSet("launch_called");
     }
 
     // The packs left in persistent storage by this or an earlier visit, as
@@ -1297,7 +1353,9 @@ class LuantiLauncher {
         if (!(await removal.promise)) {
             throw new Error(`Could not remove ${name}`);
         }
-        // Adding it again has to download and unpack it afresh.
+        // Adding it again has to download and unpack it afresh, from the
+        // server: a game that came from a zip is not there any more either.
+        this.#localPacks.delete(name);
         this.addedPacks.delete(name);
         this.packInstalls.delete(name);
         mtScheduler.removeCondition("fetched:" + name);
@@ -1422,6 +1480,119 @@ class LuantiLauncher {
         if (entry) {
             this.worldZips.delete(dir);
             entry.resolve(blob);
+        }
+    }
+
+    // What persistent storage holds for the game `name`, as {name, title}, or
+    // null if there is no such game. A game the player installed from a zip of
+    // their own has no catalog entry to be named from, so this is where the
+    // page finds a name for it.
+    async gameInfo(name) {
+        await this.#storageProbe;
+        if (!this.storageAvailable || !(await mtFsActive)) {
+            return null;
+        }
+        const conf = await readGameConf(this.storageRoot, name);
+        if (!conf) {
+            return null;
+        }
+        // "name" is what game.conf called the title before it was renamed, and
+        // games old enough to still use it are the ones least likely to be in
+        // the catalog.
+        return {name: name, title: conf.get('title') || conf.get('name') || name};
+    }
+
+    // Whether persistent storage already holds a world directory called `dir`,
+    // whether or not what is in it is a world Luanti would list. Installing
+    // over one replaces everything in it, so what matters is that the
+    // directory is taken, not that it holds a world worth keeping.
+    async worldExists(dir) {
+        await this.#storageProbe;
+        if (!this.storageAvailable || !(await mtFsActive)) {
+            return false;
+        }
+        try {
+            await opfsGetDirectory(this.storageRoot, WORLDS_DIR + '/' + dir, false);
+            return true;
+        } catch (err) {
+            return false;
+        }
+    }
+
+    // Install a world or a game from a zip archive, replacing whatever is
+    // installed under the same name: the old directory is deleted first, so
+    // that files the old one had and the new one does not are not left behind
+    // to be loaded alongside it.
+    //
+    // `kind` is 'world' or 'game'. `name` is the directory to install as, `dir`
+    // for a world and the game's own folder name for a game. `prefix` is the
+    // folder inside the archive that holds it, which is '' when the archive is
+    // that folder itself. `count` is how many entries lie below that prefix,
+    // which the progress reported along the way counts off. `data` is the
+    // archive, as an ArrayBuffer or a typed array.
+    //
+    // A game is recorded as installed under LOCAL_PACK_VERSION, so that it is
+    // listed, measured and uninstalled like a downloaded one, and never looked
+    // for on the server.
+    //
+    // The module does the unpacking, for the same reason it does a pack's:
+    // /luanti is mounted there, and unpacking from here would mean a round trip
+    // to the worker that owns persistent storage for every file in the
+    // archive. How far along it is arrives through onprogress as `wipe:<name>`
+    // while what was there is cleared out, and `unzip:<name>` while the archive
+    // is unpacked.
+    async installZip(kind, name, prefix, count, data) {
+        if (mtScheduler.isSet("launch_called")) {
+            throw new Error("Cannot install after launch");
+        }
+        if (kind != 'world' && kind != 'game') {
+            throw new Error(`Invalid install kind: ${kind}`);
+        }
+        if (kind == 'game' && !validPackName(name)) {
+            throw new Error(`Invalid game name: ${name}`);
+        }
+        await this.#storageProbe;
+        // Waiting on the mount also waits for the module to be callable. This
+        // works without persistent storage, where the install lasts as long as
+        // the page does and no longer.
+        await mtFsActive;
+        const key = `${kind}:${name}`;
+        if (this.zipInstalls.has(key)) {
+            throw new Error(`Already installing ${name}`);
+        }
+        const bytes = (data instanceof Uint8Array) ? data : new Uint8Array(data);
+        // The module takes ownership of this and frees it when it is done.
+        const buf = _malloc(bytes.byteLength);
+        if (!buf) {
+            throw new Error(`Not enough memory to unpack ${name}`);
+        }
+        HEAPU8.set(bytes, buf);
+        const entry = {};
+        entry.promise = new Promise((resolve) => { entry.resolve = resolve; });
+        this.zipInstalls.set(key, entry);
+        const kindPtr = stringToNewUTF8(kind);
+        const namePtr = stringToNewUTF8(name);
+        const prefixPtr = stringToNewUTF8(prefix);
+        emloop_install_zip(kindPtr, namePtr, prefixPtr, count, buf, bytes.byteLength);
+        _free(kindPtr);
+        _free(namePtr);
+        _free(prefixPtr);
+        if (!(await entry.promise)) {
+            throw new Error(`Could not install ${name}`);
+        }
+        if (kind == 'game') {
+            this.#localPacks.add(name);
+        }
+    }
+
+    // Internal. Called once the module is done installing from a zip, with
+    // whether it worked.
+    noteZipInstalled(kind, name, ok) {
+        const key = `${kind}:${name}`;
+        const entry = this.zipInstalls.get(key);
+        if (entry) {
+            this.zipInstalls.delete(key);
+            entry.resolve(ok);
         }
     }
 
@@ -1629,12 +1800,30 @@ class LuantiLauncher {
         mtScheduler.addCondition(installedCond, installPack, ["fsReady", fetchedCond]);
         mtScheduler.addDep("main_called", installedCond);
 
+        // A game the player installed from a zip of their own is in place
+        // already and is served from nowhere, so there is nothing to fetch.
+        if (this.#localPacks.has(name)) {
+            consolePrint(`Pack ${name} was installed from a zip`);
+            alreadyInstalled = true;
+            mtScheduler.setCondition(fetchedCond);
+            return installDone;
+        }
         if (version) {
             await this.#storageProbe;
             // Only trust what the probe found once the module has confirmed
             // that it really did mount OPFS at /luanti.
-            if (this.storageAvailable && await mtFsActive &&
-                    await readPackVersion(this.storageRoot, name) === version) {
+            const installed = (this.storageAvailable && await mtFsActive)
+                ? await readPackVersion(this.storageRoot, name) : null;
+            // What a previous visit installed from a zip, which is remembered
+            // the same way but has no version to compare against.
+            if (installed === LOCAL_PACK_VERSION) {
+                consolePrint(`Pack ${name} was installed from a zip`);
+                this.#localPacks.add(name);
+                alreadyInstalled = true;
+                mtScheduler.setCondition(fetchedCond);
+                return installDone;
+            }
+            if (installed !== null && installed === version) {
                 consolePrint(`Pack ${name} is already installed`);
                 alreadyInstalled = true;
                 mtScheduler.setCondition(fetchedCond);
