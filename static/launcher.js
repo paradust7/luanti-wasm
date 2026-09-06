@@ -53,18 +53,20 @@ canvas.emscripten {
 }
 
 /* Always painted over the canvas, top right corner. */
-#console_panel {
+#settings_panel {
   position: fixed;
   top: 8px;
   right: 8px;
   z-index: 20;
-  background-color: white;
-  padding: 0;
-  line-height: 0;
+  font-size: 13px;
+  text-align: left;
 }
 
-#console_button {
-  display: block;
+#settings_button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
   width: 28px;
   height: 24px;
   padding: 0;
@@ -72,8 +74,72 @@ canvas.emscripten {
   /* Suppress the native button chrome, which draws its own light border */
   appearance: none;
   -webkit-appearance: none;
-  /* Fill the button exactly, so no panel background shows around the icon */
-  background: url('${RELEASE_DIR}/term_icon.png') center / 100% 100% no-repeat white;
+  background-color: transparent;
+  /* The gear is drawn in currentColor */
+  color: black;
+  cursor: pointer;
+}
+
+/* Open, the console docks under the button, and it is black. Flip the gear so
+   it stays visible against it. */
+#settings_button.over_console {
+  color: white;
+}
+
+#settings_menu {
+  margin-top: 4px;
+  /* Wide enough for a full fd00:: address on one line */
+  width: 240px;
+  box-sizing: border-box;
+  padding: 8px;
+  border: 1px solid #888888;
+  background-color: white;
+  color: black;
+}
+
+#settings_console_toggle {
+  display: block;
+  width: 100%;
+  padding: 6px 0;
+  cursor: pointer;
+}
+
+#settings_address_label {
+  margin-top: 10px;
+  font-weight: bold;
+  text-align: center;
+}
+
+#settings_address {
+  display: block;
+  margin-top: 4px;
+  text-align: center;
+  color: black;
+  font-family: 'Lucida Console', Monaco, monospace;
+  /* Addresses are IPv6 literals. Wrap rather than clip, so the whole of one
+     is always readable even if the font is wider than expected. */
+  word-break: break-all;
+  /* A single click takes the whole address, not a word of it */
+  user-select: all;
+  -webkit-user-select: all;
+  cursor: text;
+}
+
+#settings_address.unassigned {
+  color: #888888;
+  font-family: arial;
+  font-style: italic;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+#settings_address_copy {
+  display: block;
+  margin: 6px auto 0;
+  /* Fixed, so the button does not resize as its label changes */
+  min-width: 62px;
+  padding: 4px 8px;
   cursor: pointer;
 }
 
@@ -150,8 +216,18 @@ const rtHTML = `
     <textarea id="console_output" class="console" readonly></textarea>
   </div>
 
-  <div id="console_panel">
-    <input id="console_button" type="button" value="" title="Toggle console" aria-label="Toggle console" onclick="consoleToggle()">
+  <div id="settings_panel">
+    <button id="settings_button" title="Settings" aria-label="Settings" aria-expanded="false" aria-haspopup="true" onclick="settingsToggle()">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path fill-rule="evenodd" d="M22.86 10.28A11.0 11.0 0 0 1 22.86 13.72L19.29 13.75A7.5 7.5 0 0 1 18.39 15.92L20.90 18.47A11.0 11.0 0 0 1 18.47 20.90L15.92 18.39A7.5 7.5 0 0 1 13.75 19.29L13.72 22.86A11.0 11.0 0 0 1 10.28 22.86L10.25 19.29A7.5 7.5 0 0 1 8.08 18.39L5.53 20.90A11.0 11.0 0 0 1 3.10 18.47L5.61 15.92A7.5 7.5 0 0 1 4.71 13.75L1.14 13.72A11.0 11.0 0 0 1 1.14 10.28L4.71 10.25A7.5 7.5 0 0 1 5.61 8.08L3.10 5.53A11.0 11.0 0 0 1 5.53 3.10L8.08 5.61A7.5 7.5 0 0 1 10.25 4.71L10.28 1.14A11.0 11.0 0 0 1 13.72 1.14L13.75 4.71A7.5 7.5 0 0 1 15.92 5.61L18.47 3.10A11.0 11.0 0 0 1 20.90 5.53L18.39 8.08A7.5 7.5 0 0 1 19.29 10.25L22.86 10.28ZM15.40 12.00A3.4 3.4 0 0 0 8.60 12.00A3.4 3.4 0 0 0 15.40 12.00Z"/>
+      </svg>
+    </button>
+    <div id="settings_menu" style="display: none">
+      <button id="settings_console_toggle" onclick="consoleToggle()">Show Console</button>
+      <div id="settings_address_label">Virtual IP Address</div>
+      <span id="settings_address" onclick="selectAddress()"></span>
+      <button id="settings_address_copy" onclick="copyAddress()">Copy</button>
+    </div>
   </div>
 `;
 
@@ -172,6 +248,12 @@ var consoleDock;
 var consoleOutput;
 var progressBar;
 var progressBarDiv;
+var settingsPanel;
+var settingsButton;
+var settingsMenu;
+var settingsConsoleToggle;
+var settingsAddress;
+var settingsAddressCopy;
 
 function activateBody() {
     const extraCSS = document.createElement("style");
@@ -198,6 +280,14 @@ function activateBody() {
     setupConsoleSplitter();
     // Triggers the first and all future updates
     consoleUpdate();
+
+    settingsPanel = document.getElementById('settings_panel');
+    settingsButton = document.getElementById('settings_button');
+    settingsMenu = document.getElementById('settings_menu');
+    settingsConsoleToggle = document.getElementById('settings_console_toggle');
+    settingsAddress = document.getElementById('settings_address');
+    settingsAddressCopy = document.getElementById('settings_address_copy');
+    setupSettingsMenu();
 
     progressBar = document.getElementById('progressbar');
     progressBarDiv = document.getElementById('progressbar_div');
@@ -320,6 +410,7 @@ var emloop_invoke_main;
 var irrlicht_resize;
 var emsocket_init;
 var emsocket_set_proxy;
+var emsocket_get_address;
 
 // Called when the wasm module is ready
 function emloop_ready() {
@@ -336,6 +427,7 @@ function emloop_ready() {
     irrlicht_resize = cwrap("irrlicht_resize", null, ["number", "number"]);
     emsocket_init = cwrap("emsocket_init", null, []);
     emsocket_set_proxy = cwrap("emsocket_set_proxy", null, ["number"]);
+    emsocket_get_address = cwrap("emsocket_get_address", "number", ["number", "number"]);
     mtScheduler.setCondition("wasmReady");
 }
 
@@ -525,7 +617,137 @@ function consoleToggle() {
     consoleDock.style.display = show ? 'block' : 'none';
     // Default to about a third of the screen, then remember the dragged width.
     setConsoleWidth(consoleWidth || Math.round(document.documentElement.clientWidth / 3));
+    syncConsoleState();
     fixGeometry(true);
+}
+
+// The settings menu hangs off the gear button in the top right corner.
+// It holds the console toggle and the address other players use to reach
+// this instance.
+
+function syncConsoleState() {
+    const shown = consoleShown();
+    if (settingsConsoleToggle) {
+        settingsConsoleToggle.innerText = shown ? 'Hide Console' : 'Show Console';
+    }
+    if (settingsButton) {
+        settingsButton.classList.toggle('over_console', shown);
+    }
+}
+
+function setupSettingsMenu() {
+    syncConsoleState();
+
+    // Close the menu when a click lands anywhere else. Capture phase, because
+    // the canvas swallows the events it receives.
+    document.addEventListener('pointerdown', (e) => {
+        if (settingsShown() && !settingsPanel.contains(e.target)) {
+            settingsHide();
+        }
+    }, true);
+}
+
+function settingsShown() {
+    return settingsMenu && settingsMenu.style.display != 'none';
+}
+
+function settingsToggle() {
+    if (settingsShown()) {
+        settingsHide();
+    } else {
+        settingsShow();
+    }
+}
+
+function settingsShow() {
+    settingsMenu.style.display = 'block';
+    settingsButton.setAttribute('aria-expanded', 'true');
+    syncConsoleState();
+    refreshAddress();
+}
+
+function settingsHide() {
+    settingsMenu.style.display = 'none';
+    settingsButton.setAttribute('aria-expanded', 'false');
+}
+
+// Room for any address the proxy hands out, which are far shorter than this.
+const ADDRESS_BUF_SIZE = 256;
+
+// Set once emsocket_init() has started the I/O thread. Asking for the address
+// before that would block the browser thread on a reply that never comes.
+var emsocketStarted = false;
+
+// The address is assigned by the proxy, is empty until the proxy answers, and
+// can change afterwards, so it is read afresh every time the menu opens.
+function readAddress() {
+    if (!emsocketStarted || !emsocket_get_address) {
+        return '';
+    }
+    const buf = _malloc(ADDRESS_BUF_SIZE);
+    try {
+        if (emsocket_get_address(buf, ADDRESS_BUF_SIZE) != 0) {
+            return '';
+        }
+        return UTF8ToString(buf);
+    } finally {
+        _free(buf);
+    }
+}
+
+// What readAddress() last returned, kept so the copy button does not have to
+// parse it back out of the element.
+var settingsAddressText = '';
+
+function refreshAddress() {
+    settingsAddressText = readAddress();
+    settingsAddress.innerText = settingsAddressText || 'Not assigned yet';
+    settingsAddress.classList.toggle('unassigned', settingsAddressText == '');
+    settingsAddressCopy.disabled = (settingsAddressText == '');
+    setCopyLabel('Copy');
+}
+
+// Puts the whole address in the document selection, so it can be copied by
+// hand when the clipboard API is unavailable.
+function selectAddress() {
+    if (!settingsAddressText) {
+        return;
+    }
+    const range = document.createRange();
+    range.selectNodeContents(settingsAddress);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+}
+
+var copyLabelTimer = 0;
+function setCopyLabel(text) {
+    clearTimeout(copyLabelTimer);
+    settingsAddressCopy.innerText = text;
+    if (text != 'Copy') {
+        copyLabelTimer = setTimeout(() => { setCopyLabel('Copy'); }, 1500);
+    }
+}
+
+function copyAddress() {
+    const address = settingsAddressText;
+    if (!address) {
+        return;
+    }
+    // Select it as well, so it can still be copied by hand if the clipboard
+    // is refused (navigator.clipboard needs a secure context).
+    selectAddress();
+    const copied = () => { setCopyLabel('Copied'); };
+    const failed = () => { setCopyLabel('Ctrl-C'); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(address).then(copied, failed);
+        return;
+    }
+    try {
+        document.execCommand('copy') ? copied() : failed();
+    } catch (err) {
+        failed();
+    }
 }
 
 // Resizing the canvas on every pointermove is expensive, so coalesce into frames.
@@ -1917,6 +2139,7 @@ class LuantiLauncher {
         // Setup emsocket
         // TODO: emsocket should export the helpers for this
         emsocket_init();
+        emsocketStarted = true;
         const proxyBuf = stringToNewUTF8(this.proxyUrl);
         emsocket_set_proxy(proxyBuf);
         _free(proxyBuf);

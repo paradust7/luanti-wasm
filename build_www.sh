@@ -51,7 +51,6 @@ apply_substitutions htaccess_release "$RELEASE_DIR"/.htaccess
 apply_substitutions launcher.js "$RELEASE_DIR"/launcher.js
 apply_substitutions worker.js "$RELEASE_DIR"/worker.js
 apply_substitutions htaccess_packs "$PACKS_DIR"/.htaccess
-cp term_icon.png "$RELEASE_DIR"/term_icon.png
 popd
 
 # Copy base file system pack
