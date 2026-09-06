@@ -20,5 +20,5 @@ getsource "https://www.libarchive.org/downloads/libarchive-3.6.1.tar.xz" 5a411ac
 getrepo zstd "https://github.com/facebook/zstd.git" f8745da6ff1ad1e7bab384bd1f9d742439278e99
 
 # These repos are part of the fork
-getrepo webshims "https://github.com/paradust7/webshims.git" 0767fdedd87f61a28a34f6444b669caf563a9fd5
-getrepo luanti "https://github.com/paradust7/luanti.git" 3cc52a22e03ef9bcd783ee1d928cae83a52bc010
+getrepo webshims "https://github.com/paradust7/webshims.git" df4dabbc2a2d140789a1b8a924d0a5a4343733ed
+getrepo luanti "https://github.com/paradust7/luanti.git" 448d96534dee123e5cb94430df3f0d7612e504fd

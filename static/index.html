@@ -42,14 +42,6 @@
       <button id="launch_server" style="width: 300px; height: 50px; font-size: 20pt;">Launch Server</button>
 
     </div>
-    <div id="join_form" class="console" style="color: white; display: none;">
-      <b>Joining game:</b>
-      <br/>
-      <b>Player Name:</b>
-      <input style="border: 2px solid black; width: 400px; height: 2em" type="text" id="join_username" required="" pattern="[A-Za-z0-9_-]{1,20}" maxlength="19" title="Alphanumeric, 19 characters max">
-      <br/>
-      <button id="join_launch">Join Game</button>
-    </div>
     <script type="text/javascript" src="%__RELEASE_UUID__%/launcher.js"></script>
     <script type="text/javascript">
 
@@ -61,7 +53,6 @@
       }
 
       const launchForm = document.getElementById('launch_form');
-      const joinForm = document.getElementById('join_form');
       const tcon = document.getElementById('temporary_console');
       function tcon_print(prefix, line) {
           if (prefix) {
@@ -79,16 +70,11 @@
 
       function wipePage() {
           launchForm.remove();
-          joinForm.remove();
           tcon.remove();
       }
 
       function enableLaunchForm() {
-          if (join_code) {
-              joinForm.style.display = 'block';
-          } else {
-              launchForm.style.display = 'block';
-          }
+          launchForm.style.display = 'block';
 
           const select_proxy = document.getElementById('select_proxy');
           const proxies = [
@@ -158,7 +144,7 @@
               launchServer.disabled = false;
           });
 
-          launchServer.addEventListener('click', async () => {
+          launchServer.addEventListener('click', () => {
               const proxyIndex = document.getElementById('select_proxy').value;
               const username = document.getElementById('multiplayer_username').value;
               const world = worlds[select_world.value];
@@ -173,14 +159,11 @@
               const game = world.gameid;
               wipePage();
 
-              const proxy = proxies[proxyIndex][0];
-              mtl.setProxy(proxy);
+              // The address other players reach this server at is assigned
+              // by the proxy when emsocket starts up, and is shown from
+              // inside the game.
+              mtl.setProxy(proxies[proxyIndex][0]);
               mtl.addPack(game);
-              const [cmd, serverCode, clientCode] = await queryProxy(`MAKEVPN ${game}`, proxy);
-              if (cmd != 'NEWVPN') {
-                  alert("Invalid response from proxy");
-                  return;
-              }
               const args = new LuantiArgs();
               args.gameid = game;
               args.name = username;
@@ -188,78 +171,11 @@
               // --address would make Luanti act like a client instead of a host.
               args.port = 30000;
               args.go = true;
-              history.pushState({}, "", `?proxy=${proxyIndex}&game=${game}&join=${clientCode}`);
-              mtl.setVPN(serverCode, clientCode);
               enableMemorySaving(mtl);
               mtl.setLang(select_language.value);
               mtl.launch(args);
           });
 
-          const joinLaunch = document.getElementById('join_launch');
-          joinLaunch.addEventListener('click', async () => {
-              const username = document.getElementById('join_username').value;
-              if (username.length == 0) {
-                  alert("Empty username");
-                  return;
-              }
-              wipePage();
-              mtl.setProxy(proxies[join_proxy][0]);
-              mtl.addPack(join_game);
-
-              const args = new LuantiArgs();
-              args.gameid = join_game;
-              args.name = username;
-              args.address = '172.16.0.1';
-              args.port = 30000;
-              args.go = true;
-              mtl.setVPN(null, join_code);
-              enableMemorySaving(mtl);
-              mtl.setLang(select_language.value);
-              mtl.launch(args);
-          });
-      }
-
-      function queryProxy(cmd, proxy) {
-          return new Promise((resolve, reject) => {
-              let finished = false;
-              const ws = new WebSocket(proxy);
-              ws.addEventListener('open', (event) => {
-                  ws.send(cmd);
-              });
-              ws.addEventListener('error', (event) => {
-                  alert('Error initiating proxy connection');
-                  finished = true;
-                  reject(new Error('Received error'));
-              });
-              ws.addEventListener('close', (event) => {
-                  if (!finished) {
-                      alert('Proxy connection closed unexpectedly');
-                      finished = true;
-                      reject(new Error('Received close'));
-                  }
-              });
-              ws.addEventListener('message', (event) => {
-                  if (typeof event.data !== 'string') {
-                      alert('Invalid message received from proxy');
-                      finished = true;
-                      reject(new Error('Invalid message'));
-                      return;
-                  }
-                  finished = true;
-                  ws.close();
-                  resolve(event.data.split(' '));
-              });
-          });
-      }
-
-      let join_code = null;
-      let join_proxy = null;
-      let join_game = null;
-      const peek_params = new URLSearchParams(window.location.search);
-      if (peek_params.has("join")) {
-          join_code = peek_params.get("join");
-          join_game = peek_params.get("game");
-          join_proxy = peek_params.get("proxy");
       }
 
       const args = LuantiArgs.fromQueryString(window.location.search);

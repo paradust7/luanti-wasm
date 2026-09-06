@@ -320,7 +320,6 @@ var emloop_invoke_main;
 var irrlicht_resize;
 var emsocket_init;
 var emsocket_set_proxy;
-var emsocket_set_vpn;
 
 // Called when the wasm module is ready
 function emloop_ready() {
@@ -337,7 +336,6 @@ function emloop_ready() {
     irrlicht_resize = cwrap("irrlicht_resize", null, ["number", "number"]);
     emsocket_init = cwrap("emsocket_init", null, []);
     emsocket_set_proxy = cwrap("emsocket_set_proxy", null, ["number"]);
-    emsocket_set_vpn = cwrap("emsocket_set_vpn", null, ["number"]);
     mtScheduler.setCondition("wasmReady");
 }
 
@@ -1216,9 +1214,6 @@ class LuantiLauncher {
         // 'kind:name' -> a promise settled once the module has installed it
         // from a zip.
         this.zipInstalls = new Map();
-        this.vpn = null;
-        this.serverCode = null;
-        this.clientCode = null;
         this.proxyUrl = "wss://luanti.dustlabs.io/proxy";
         this.packsDir = DEFAULT_PACKS_DIR;
         this.packsDirIsCors = false;
@@ -1641,13 +1636,6 @@ class LuantiLauncher {
         return mtScheduler.isSet("ready");
     }
 
-    // Must be set before launch()
-    setVPN(serverCode, clientCode) {
-        this.serverCode = serverCode;
-        this.clientCode = clientCode;
-        this.vpn = serverCode ? serverCode : clientCode;
-    }
-
     // Set a key/value pair in minetest.conf
     // Overrides previous values of the same key.
     //
@@ -1932,11 +1920,6 @@ class LuantiLauncher {
         const proxyBuf = stringToNewUTF8(this.proxyUrl);
         emsocket_set_proxy(proxyBuf);
         _free(proxyBuf);
-        if (this.vpn) {
-            const vpnBuf = stringToNewUTF8(this.vpn);
-            emsocket_set_vpn(vpnBuf);
-            _free(vpnBuf);
-        }
         mtScheduler.setCondition("launch_called");
     }
 }
