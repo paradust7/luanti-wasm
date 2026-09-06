@@ -274,6 +274,7 @@ function activateBody() {
 
     setupResizeHandlers();
     setupEscapeHandlers();
+    setupClipboardHandlers();
 
     consoleDock = document.getElementById('console_dock');
     consoleOutput = document.getElementById('console_output');
@@ -408,6 +409,8 @@ var emloop_install_zip;
 var emloop_set_conf;
 var emloop_invoke_main;
 var irrlicht_resize;
+var irrlicht_set_clipboard;
+var irrlicht_paste;
 var emsocket_init;
 var emsocket_set_proxy;
 var emsocket_get_address;
@@ -425,6 +428,8 @@ function emloop_ready() {
     emloop_set_conf = cwrap("emloop_set_conf", null, ["number", "number"]);
     emloop_invoke_main = cwrap("emloop_invoke_main", null, ["number", "number"]);
     irrlicht_resize = cwrap("irrlicht_resize", null, ["number", "number"]);
+    irrlicht_set_clipboard = cwrap("irrlicht_set_clipboard", null, ["number"]);
+    irrlicht_paste = cwrap("irrlicht_paste", null, []);
     emsocket_init = cwrap("emsocket_init", null, []);
     emsocket_set_proxy = cwrap("emsocket_set_proxy", null, ["number"]);
     emsocket_get_address = cwrap("emsocket_get_address", "number", ["number", "number"]);
@@ -1009,6 +1014,96 @@ function sendEscapeKey() {
     setTimeout(() => {
         window.dispatchEvent(new KeyboardEvent('keyup', init));
     }, 30);
+}
+
+// Emscripten's SDL does not implement clipboard support. So we capture browser
+// pastes here and push them into the module ourselves.
+//
+// The sequence must be handled carefully to prevent Ctrl+V from pasting the
+// old state of the clipboard:
+//
+// - User presses Ctrl+V
+// - Capture 'keydown' for Ctrl+V and prevent it from going to SDL. Let the
+//   browser's default handler process it.
+// - If we're allowed to paste, the browser will generate a 'paste' event
+//   with the clipboard contents.
+// - Transfer contents to module.
+// - Generate synthetic Ctrl+V to trigger Luanti's paste.
+//
+
+// How long to wait for the 'paste' event before giving up.
+const PASTE_EVENT_TIMEOUT_MS = 150;
+
+var pasteTimer = null;       // waiting for the 'paste' event of a Ctrl+V
+var pasteKeyHeld = false;    // the V of a swallowed Ctrl+V is still down
+var ignorePasteUntil = 0;    // a 'paste' that lost the race above is stale
+
+// Cmd+V is caught as well. SDL reports it as GUI+V, which Luanti does not
+// treat as a paste, so on macOS this is the only thing that makes it work.
+function isPasteKey(e) {
+    return e.code === 'KeyV' && (e.ctrlKey || e.metaKey) && !e.altKey;
+}
+
+// Don't intercept pastes into one of the page's regular fields.
+function isEditableTarget(target) {
+    if (!target || !target.tagName) return false;
+    const tag = target.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' ||
+           target.isContentEditable;
+}
+
+// Send `text` to Luanti and generate a synthetic paste event.
+function doPaste(text) {
+    if (pasteTimer !== null) {
+        clearTimeout(pasteTimer);
+        pasteTimer = null;
+    }
+    if (text) {
+        const ptr = stringToNewUTF8(text);
+        irrlicht_set_clipboard(ptr);
+        _free(ptr);
+    }
+    irrlicht_paste();
+}
+
+function setupClipboardHandlers() {
+    // Capture phase, and registered before the wasm module installs its own
+    // handlers, so this runs first and can keep the keypress from SDL.
+    window.addEventListener('keydown', (e) => {
+        if (!e.isTrusted || !isPasteKey(e)) return;
+        if (!irrlicht_paste) return; // module isn't up yet
+        if (isEditableTarget(e.target)) return;
+
+        // Note there is no preventDefault() here: the default action is what
+        // makes the browser deliver the 'paste' event.
+        e.stopImmediatePropagation();
+        pasteKeyHeld = true;
+        if (pasteTimer === null) {
+            pasteTimer = setTimeout(() => {
+                pasteTimer = null;
+                ignorePasteUntil = now() + PASTE_EVENT_TIMEOUT_MS;
+                doPaste(null);
+            }, PASTE_EVENT_TIMEOUT_MS);
+        }
+    }, true);
+
+    // The release of a key SDL never saw pressed. Luanti has already had the
+    // matching pair from irrlicht_paste().
+    window.addEventListener('keyup', (e) => {
+        if (!e.isTrusted || !pasteKeyHeld || e.code !== 'KeyV') return;
+        pasteKeyHeld = false;
+        e.stopImmediatePropagation();
+    }, true);
+
+    // Fires for Ctrl+V, and for a paste from the browser's own context menu.
+    document.addEventListener('paste', (e) => {
+        if (!irrlicht_paste) return;
+        if (isEditableTarget(e.target)) return;
+        e.preventDefault();
+        // The fallback above already pasted for this keypress.
+        if (now() < ignorePasteUntil) return;
+        doPaste(e.clipboardData ? e.clipboardData.getData('text/plain') : null);
+    });
 }
 
 class LuantiArgs {
