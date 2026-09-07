@@ -42,6 +42,13 @@
       <button id="launch_server" style="width: 300px; height: 50px; font-size: 20pt;">Launch Server</button>
 
     </div>
+    <div id="join_form" class="console" style="color: white; display: none;">
+      <hr>
+      <b style="font-size: 20pt;">Join a Game from Native Luanti</b>
+      <br/>
+      <div id="join_status" style="margin-top: 1em; font-size: 14pt;"></div>
+      <hr>
+    </div>
     <script type="text/javascript" src="%__RELEASE_UUID__%/launcher.js"></script>
     <script type="text/javascript">
 
@@ -53,7 +60,18 @@
       }
 
       const launchForm = document.getElementById('launch_form');
+      const joinForm = document.getElementById('join_form');
       const tcon = document.getElementById('temporary_console');
+
+      // A join code belongs to the proxy that issued it, so only that one is
+      // asked. There is one proxy behind this page.
+      const PROXIES = [
+          [ "wss://na1.dustlabs.io/mtproxy", "North America" ],
+          [ "wss://sa1.dustlabs.io/mtproxy", "South America" ],
+          [ "wss://eu1.dustlabs.io/mtproxy", "Europe" ],
+          [ "wss://ap1.dustlabs.io/mtproxy", "Asia" ],
+          [ "wss://ap2.dustlabs.io/mtproxy", "Australia" ],
+      ];
       function tcon_print(prefix, line) {
           if (prefix) {
               for (child of tcon.childNodes) {
@@ -77,14 +95,7 @@
           launchForm.style.display = 'block';
 
           const select_proxy = document.getElementById('select_proxy');
-          const proxies = [
-              [ "wss://na1.dustlabs.io/mtproxy", "North America" ],
-              [ "wss://sa1.dustlabs.io/mtproxy", "South America" ],
-              [ "wss://eu1.dustlabs.io/mtproxy", "Europe" ],
-              [ "wss://ap1.dustlabs.io/mtproxy", "Asia" ],
-              [ "wss://ap2.dustlabs.io/mtproxy", "Australia" ],
-          ];
-          proxies.forEach((entry, index) => {
+          PROXIES.forEach((entry, index) => {
               const opt = document.createElement('option');
               opt.value = index;
               opt.innerText = entry[1];
@@ -111,7 +122,7 @@
           const launch = document.getElementById('launch');
           launch.addEventListener('click', () => {
               const proxyIndex = document.getElementById('select_proxy').value;
-              const proxy = proxies[proxyIndex][0];
+              const proxy = PROXIES[proxyIndex][0];
               wipePage();
               mtl.setProxy(proxy);
               mtl.setLang(select_language.value);
@@ -162,7 +173,7 @@
               // The address other players reach this server at is assigned
               // by the proxy when emsocket starts up, and is shown from
               // inside the game.
-              mtl.setProxy(proxies[proxyIndex][0]);
+              mtl.setProxy(PROXIES[proxyIndex][0]);
               mtl.addPack(game);
               const args = new LuantiArgs();
               args.gameid = game;
@@ -178,32 +189,62 @@
 
       }
 
-      const args = LuantiArgs.fromQueryString(window.location.search);
-      tcon_print("", "Luanti Arguments: " + JSON.stringify(args.toArray(), null, '    '));
-      tcon_print("", "Data Packs: " + JSON.stringify(args.packs, null, '    '));
+      // Someone who followed an invite link is only told where to point
+      // desktop Luanti, so the launcher and its wasm are never loaded here.
+      function showJoinPage(joinCode) {
+          tcon.remove();
+          launchForm.remove();
+          joinForm.style.display = 'block';
+          const joinStatus = document.getElementById('join_status');
+          joinStatus.innerText = 'Contacting the server...';
+          const proxyUrl = PROXIES[0][0];
+          queryJoinCode(proxyUrl, joinCode).then((port) => {
+              joinStatus.innerText =
+                  `You may now connect to: ${joinHost(proxyUrl)} ${port} in Luanti. ` +
+                  `If you don't have an account on the server, be sure to ` +
+                  `register first.`;
+          }, (err) => {
+              joinStatus.innerText = err.message;
+          });
+      }
 
-      const mtl = new LuantiLauncher();
-      mtl.addPacks(args.packs);
-      mtl.onprint = (text) => {
-          tcon_print("", text);
-      };
-      mtl.onprogress = (name, progress) => {
-          const prefix = `Task ${name} : `;
-          const pct = `${Math.round(progress * 100)}%`;
-          tcon_print(prefix, pct);
-      };
-      mtl.onready = () => {
-          tcon_print("", "READY!");
-          enableLaunchForm();
-      };
-      mtl.onexit = (status) => {
-          tcon_print("", `Luanti exited with status ${status}. Reload to play again.`);
-      };
-      mtl.onerror = (err) => {
-          tcon_print("", "**************** FATAL ERROR ******************");
-          tcon_print("", err);
-          tcon_print("", "***********************************************");
-      };
+      var args;
+      var mtl;
+      function startLauncher() {
+          args = LuantiArgs.fromQueryString(window.location.search);
+          tcon_print("", "Luanti Arguments: " + JSON.stringify(args.toArray(), null, '    '));
+          tcon_print("", "Data Packs: " + JSON.stringify(args.packs, null, '    '));
+
+          mtl = new LuantiLauncher();
+          mtl.addPacks(args.packs);
+          mtl.onprint = (text) => {
+              tcon_print("", text);
+          };
+          mtl.onprogress = (name, progress) => {
+              const prefix = `Task ${name} : `;
+              const pct = `${Math.round(progress * 100)}%`;
+              tcon_print(prefix, pct);
+          };
+          mtl.onready = () => {
+              tcon_print("", "READY!");
+              enableLaunchForm();
+          };
+          mtl.onexit = (status) => {
+              tcon_print("", `Luanti exited with status ${status}. Reload to play again.`);
+          };
+          mtl.onerror = (err) => {
+              tcon_print("", "**************** FATAL ERROR ******************");
+              tcon_print("", err);
+              tcon_print("", "***********************************************");
+          };
+      }
+
+      const joinCode = new URLSearchParams(window.location.search).get('join');
+      if (joinCode) {
+          showJoinPage(joinCode);
+      } else {
+          startLauncher();
+      }
     </script>
   </body>
 </html>

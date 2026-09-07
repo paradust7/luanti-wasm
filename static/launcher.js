@@ -143,6 +143,15 @@ canvas.emscripten {
   cursor: pointer;
 }
 
+#settings_invite_copy {
+  display: block;
+  margin: 6px auto 0;
+  /* Fixed, so the button does not resize as its label changes */
+  min-width: 90px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
 /* When shown, the console docks to the right of the canvas.
    Its width is set by dragging #console_splitter. */
 #console_dock {
@@ -227,6 +236,7 @@ const rtHTML = `
       <div id="settings_address_label">Virtual IP Address</div>
       <span id="settings_address" onclick="selectAddress()"></span>
       <button id="settings_address_copy" onclick="copyAddress()">Copy</button>
+      <button id="settings_invite_copy" onclick="copyInviteLink()" title="Copy a link that lets someone join from desktop Luanti">Invite Link</button>
     </div>
   </div>
 `;
@@ -254,6 +264,7 @@ var settingsMenu;
 var settingsConsoleToggle;
 var settingsAddress;
 var settingsAddressCopy;
+var settingsInviteCopy;
 
 function activateBody() {
     const extraCSS = document.createElement("style");
@@ -288,6 +299,7 @@ function activateBody() {
     settingsConsoleToggle = document.getElementById('settings_console_toggle');
     settingsAddress = document.getElementById('settings_address');
     settingsAddressCopy = document.getElementById('settings_address_copy');
+    settingsInviteCopy = document.getElementById('settings_invite_copy');
     setupSettingsMenu();
 
     progressBar = document.getElementById('progressbar');
@@ -381,7 +393,18 @@ class LaunchScheduler {
 }
 const mtScheduler = new LaunchScheduler();
 
+// True when this page was opened from an invite link. Such a page only
+// tells a desktop player where to connect, and never runs the game.
+function isInvitePage() {
+    return new URLSearchParams(window.location.search).has('join');
+}
+
 function loadWasm() {
+    // Nothing on an invite page runs the game, so the module, which is a
+    // large download, is not fetched for one.
+    if (isInvitePage()) {
+        return;
+    }
     // Start loading the wasm module
     // The module will call emloop_ready when it is loaded
     // and waiting for main() arguments.
@@ -414,6 +437,7 @@ var irrlicht_paste;
 var emsocket_init;
 var emsocket_set_proxy;
 var emsocket_get_address;
+var emsocket_get_joincode;
 
 // Called when the wasm module is ready
 function emloop_ready() {
@@ -433,6 +457,7 @@ function emloop_ready() {
     emsocket_init = cwrap("emsocket_init", null, []);
     emsocket_set_proxy = cwrap("emsocket_set_proxy", null, ["number"]);
     emsocket_get_address = cwrap("emsocket_get_address", "number", ["number", "number"]);
+    emsocket_get_joincode = cwrap("emsocket_get_joincode", "number", ["number", "number"]);
     mtScheduler.setCondition("wasmReady");
 }
 
@@ -679,6 +704,9 @@ function settingsHide() {
 // Room for any address the proxy hands out, which are far shorter than this.
 const ADDRESS_BUF_SIZE = 256;
 
+// A join code is 16 hex characters. This leaves room to spare.
+const JOINCODE_BUF_SIZE = 64;
+
 // Set once emsocket_init() has started the I/O thread. Asking for the address
 // before that would block the browser thread on a reply that never comes.
 var emsocketStarted = false;
@@ -700,16 +728,46 @@ function readAddress() {
     }
 }
 
+// The join code that goes with the address, issued by the proxy at the same
+// time. Empty until the proxy answers.
+function readJoinCode() {
+    if (!emsocketStarted || !emsocket_get_joincode) {
+        return '';
+    }
+    const buf = _malloc(JOINCODE_BUF_SIZE);
+    try {
+        if (emsocket_get_joincode(buf, JOINCODE_BUF_SIZE) != 0) {
+            return '';
+        }
+        return UTF8ToString(buf);
+    } finally {
+        _free(buf);
+    }
+}
+
 // What readAddress() last returned, kept so the copy button does not have to
 // parse it back out of the element.
 var settingsAddressText = '';
 
+// What readJoinCode() last returned. Unlike the address it is never shown,
+// only put in the link the invite button copies.
+var settingsJoinCode = '';
+
 function refreshAddress() {
+    const previous = settingsAddressText;
     settingsAddressText = readAddress();
     settingsAddress.innerText = settingsAddressText || 'Not assigned yet';
     settingsAddress.classList.toggle('unassigned', settingsAddressText == '');
     settingsAddressCopy.disabled = (settingsAddressText == '');
     setCopyLabel('Copy');
+    // The join code is issued with the address and changes only when it
+    // does. Reading it costs a round trip to the I/O thread, so the menu
+    // does not pay for one every time it opens.
+    if (settingsAddressText != previous || settingsJoinCode == '') {
+        settingsJoinCode = settingsAddressText ? readJoinCode() : '';
+    }
+    settingsInviteCopy.disabled = (settingsJoinCode == '');
+    setInviteLabel('Invite Link');
 }
 
 // Puts the whole address in the document selection, so it can be copied by
@@ -753,6 +811,107 @@ function copyAddress() {
     } catch (err) {
         failed();
     }
+}
+
+var inviteLabelTimer = 0;
+function setInviteLabel(text) {
+    clearTimeout(inviteLabelTimer);
+    settingsInviteCopy.innerText = text;
+    if (text != 'Invite Link') {
+        inviteLabelTimer = setTimeout(() => { setInviteLabel('Invite Link'); }, 1500);
+    }
+}
+
+// The link that lets someone join this game from desktop Luanti. Opening it
+// tells them which address and port to connect to, and is what gets them
+// through the proxy.
+function inviteLink(joinCode) {
+    return `${window.location.origin}${window.location.pathname}?join=${joinCode}`;
+}
+
+function copyInviteLink() {
+    const joinCode = settingsJoinCode;
+    if (!joinCode) {
+        return;
+    }
+    const copied = () => { setInviteLabel('Copied'); };
+    const failed = () => { setInviteLabel('Failed'); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(inviteLink(joinCode)).then(copied, failed);
+        return;
+    }
+    // No clipboard API (it needs a secure context), so fall back to copying
+    // the document selection, which means putting the link in the document.
+    const holder = document.createElement('span');
+    holder.style.position = 'fixed';
+    holder.style.opacity = '0';
+    holder.innerText = inviteLink(joinCode);
+    document.body.appendChild(holder);
+    try {
+        const range = document.createRange();
+        range.selectNodeContents(holder);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.execCommand('copy') ? copied() : failed();
+        selection.removeAllRanges();
+    } catch (err) {
+        failed();
+    } finally {
+        holder.remove();
+    }
+}
+
+// Where a desktop player points Luanti. The port that goes with it was
+// opened by the proxy that answered the join query, so the address has to be
+// that proxy's own, which is not in general the host serving this page.
+function joinHost(proxyUrl) {
+    return new URL(proxyUrl).hostname;
+}
+
+// Asks the proxy which UDP port an invite link leads to.
+//
+// The answer is only half of what this does: it also tells the proxy that
+// this browser's address is the one allowed to use that port, which is what
+// lets desktop Luanti through. Resolves with the port number.
+function queryJoinCode(proxyUrl, joinCode) {
+    return new Promise((resolve, reject) => {
+        if (!/^[0-9a-f]{16}$/.test(joinCode)) {
+            reject(new Error("That invite link is malformed."));
+            return;
+        }
+        const ws = new WebSocket(proxyUrl);
+        let settled = false;
+        const settle = (port, err) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            ws.onopen = ws.onerror = ws.onclose = ws.onmessage = null;
+            ws.close();
+            if (err) {
+                reject(err);
+            } else {
+                resolve(port);
+            }
+        };
+        ws.onopen = () => { ws.send('JOIN ' + joinCode); };
+        ws.onerror = () => { settle(0, new Error("Could not reach the server.")); };
+        ws.onclose = () => { settle(0, new Error("The server closed before answering.")); };
+        ws.onmessage = (e) => {
+            const parts = (typeof e.data === 'string') ? e.data.split(' ') : [];
+            if (parts.length === 3 && parts[0] === 'JOIN' && parts[1] === 'OK') {
+                const port = Number(parts[2]);
+                if (Number.isInteger(port) && port > 0 && port < 65536) {
+                    settle(port, null);
+                    return;
+                }
+            }
+            // The usual reason: the host closed their game, so the invite
+            // went with it.
+            settle(0, new Error("That invite is no longer valid. Ask for a new link."));
+        };
+    });
 }
 
 // Resizing the canvas on every pointermove is expensive, so coalesce into frames.
