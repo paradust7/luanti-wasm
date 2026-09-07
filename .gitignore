@@ -11,4 +11,6 @@ sources/zstd
 sources/webshims
 sources/luanti
 sources/minetest_game
+# Unpacked from the npm tarballs by fetch_xterm.sh
+sources/xterm
 emsdk/

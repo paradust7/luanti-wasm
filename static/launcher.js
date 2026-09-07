@@ -80,8 +80,8 @@ canvas.emscripten {
   cursor: pointer;
 }
 
-/* Open, the console docks under the button, and it is black. Flip the gear so
-   it stays visible against it. */
+/* Open, the console docks under the button, and it is black. So is the terminal
+   of a server-only run. Flip the gear so it stays visible against either. */
 #settings_button.over_console {
   color: white;
 }
@@ -190,6 +190,19 @@ canvas.emscripten {
   resize: none;
 }
 
+/* A server-only run has no game window, so the terminal gets the screen that
+   the canvas would otherwise have had. Sized by fitTerminal(). */
+#terminal_container {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  padding: 4px;
+  background-color: black;
+}
+
 .console {
   width: 100%;
   margin: 0 auto;
@@ -218,6 +231,9 @@ const rtHTML = `
   </div>
 
   <div class="emscripten" id="canvas_container">
+  </div>
+
+  <div id="terminal_container" style="display: none">
   </div>
 
   <div id="console_dock" style="display: none">
@@ -254,6 +270,7 @@ mtCanvas.width = 1024;
 mtCanvas.height = 600;
 
 var canvasContainer;
+var terminalContainer;
 var consoleDock;
 var consoleOutput;
 var progressBar;
@@ -282,6 +299,14 @@ function activateBody() {
 
     canvasContainer = document.getElementById('canvas_container');
     canvasContainer.appendChild(mtCanvas);
+    terminalContainer = document.getElementById('terminal_container');
+
+    // Nothing is ever drawn on a server-only run, so the canvas would only sit
+    // there black. The terminal takes its place.
+    if (terminalMode) {
+        canvasContainer.style.display = 'none';
+        terminalContainer.style.display = 'block';
+    }
 
     setupResizeHandlers();
     setupEscapeHandlers();
@@ -313,7 +338,12 @@ function updateProgressBar(doneBytes, neededBytes) {
     PB_bytes_downloaded += doneBytes;
     PB_bytes_needed += neededBytes;
     if (progressBar) {
-        progressBarDiv.style.display = (PB_bytes_downloaded == PB_bytes_needed) ? "none" : "block";
+        const display = (PB_bytes_downloaded == PB_bytes_needed) ? "none" : "block";
+        if (progressBarDiv.style.display != display) {
+            progressBarDiv.style.display = display;
+            // The header just changed height, and the terminal sits below it.
+            fitTerminal();
+        }
         const pct = PB_bytes_needed ? Math.round(100 * PB_bytes_downloaded / PB_bytes_needed) : 0;
         progressBar.value = `${pct}`;
         progressBar.innerText = `${pct}%`;
@@ -431,6 +461,8 @@ var emloop_zip_world;
 var emloop_install_zip;
 var emloop_set_conf;
 var emloop_invoke_main;
+var emloop_terminal_input;
+var emloop_terminal_resize;
 var irrlicht_resize;
 var irrlicht_set_clipboard;
 var irrlicht_paste;
@@ -451,6 +483,8 @@ function emloop_ready() {
                                ["number", "number", "number", "number", "number", "number"]);
     emloop_set_conf = cwrap("emloop_set_conf", null, ["number", "number"]);
     emloop_invoke_main = cwrap("emloop_invoke_main", null, ["number", "number"]);
+    emloop_terminal_input = cwrap("emloop_terminal_input", null, ["number", "number"]);
+    emloop_terminal_resize = cwrap("emloop_terminal_resize", null, ["number", "number"]);
     irrlicht_resize = cwrap("irrlicht_resize", null, ["number", "number"]);
     irrlicht_set_clipboard = cwrap("irrlicht_set_clipboard", null, ["number"]);
     irrlicht_paste = cwrap("irrlicht_paste", null, []);
@@ -651,6 +685,174 @@ function consoleToggle() {
     fixGeometry(true);
 }
 
+///////////////////////////////////////////////////////////////
+// Terminal
+//
+// Hosting with --server never opens a game window: SDL is not initialized,
+// nothing is ever drawn, and the canvas would only sit there black. Such a run
+// is its console and nothing else, so the page gives the whole screen to a
+// terminal instead.
+//
+// The terminal is a byte stream in both directions, and it is the module's
+// stdin, stdout and stderr. What is typed goes to the module exactly as
+// xterm.js produces it, escape sequences and all, and is neither echoed nor
+// line-edited here: what appears on the screen is what the module writes back,
+// the way a tty behaves. The log a server prints reaches the screen the same
+// way, by being printed -- see the terminal section of mainloop.cpp -- so
+// nothing has to be copied here from the page's own console.
+//
+// Module output arrives as bytes rather than as text. Decoding it here would
+// mean splitting a character in half whenever one straddled two writes, so the
+// bytes go to xterm.js as they are and it does the decoding.
+
+// Set by launch() for a run with no game window.
+var terminalMode = false;
+
+// The xterm.js Terminal, once its script has loaded and it has been opened.
+var xTerminal = null;
+var xTerminalFit = null;
+
+// Whether what was written last ended its line. The page prints the odd line of
+// its own (see consolePrint), and one of those would otherwise land in the
+// middle of whatever the module has on the screen.
+var terminalAtLineStart = true;
+
+// What was written before xterm.js finished loading. A server says a good deal
+// on the way up and none of it is worth losing, so it is held here and replayed
+// by startTerminal().
+var terminalBacklog = [];
+
+function loadScript(src) {
+    return new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = src;
+        script.onload = () => resolve();
+        script.onerror = () => reject(new Error(`Could not load ${src}`));
+        document.head.appendChild(script);
+    });
+}
+
+// xterm.js is a large download and an ordinary game never shows a terminal, so
+// it is only fetched for a run that is going to use one.
+function loadXterm() {
+    const css = document.createElement('link');
+    css.rel = 'stylesheet';
+    css.href = RELEASE_DIR + '/xterm/xterm.css';
+    document.head.appendChild(css);
+    return Promise.all([
+        loadScript(RELEASE_DIR + '/xterm/xterm.js'),
+        loadScript(RELEASE_DIR + '/xterm/addon-fit.js'),
+    ]);
+}
+
+async function startTerminal() {
+    await loadXterm();
+    xTerminal = new Terminal({
+        cursorBlink: true,
+        // What a tty's line discipline does with ONLCR. Without it a printed
+        // "\n" would step down a line without returning to the left margin,
+        // and the log would come out as a staircase. A program that wants the
+        // other behaviour turns ONLCR off; ncurses is the one to watch for.
+        convertEol: true,
+        // The same face the console dock uses.
+        fontFamily: "'Lucida Console', Monaco, monospace",
+        fontSize: 14,
+        scrollback: 10000,
+        theme: { background: '#000000', foreground: '#ffffff' },
+    });
+    xTerminalFit = new FitAddon.FitAddon();
+    xTerminal.loadAddon(xTerminalFit);
+    xTerminal.open(terminalContainer);
+
+    // Raw, the way a tty delivers input.
+    xTerminal.onData(sendTerminalInput);
+
+    // The module is told the size for the same reason a program is sent
+    // SIGWINCH: it is what decides how to lay the screen out.
+    xTerminal.onResize(({cols, rows}) => {
+        if (emloop_terminal_resize) {
+            emloop_terminal_resize(cols, rows);
+        }
+    });
+
+    // Sized before anything is written, so that what is written wraps to the
+    // width it is going to be read at.
+    fitTerminal();
+
+    // Everything written before the terminal was ready, so the whole run is on
+    // the screen and not just the part of it that came after this loaded.
+    for (const chunk of terminalBacklog) {
+        xTerminal.write(chunk);
+    }
+    terminalBacklog = [];
+
+    xTerminal.focus();
+}
+
+// Put `data` on the screen exactly as given: a string from the page, or a
+// Uint8Array of what the module printed. xterm.js takes either.
+function terminalWrite(data) {
+    if (!data || !data.length) {
+        return;
+    }
+    if (xTerminal) {
+        xTerminal.write(data);
+    } else {
+        terminalBacklog.push(data);
+    }
+    const last = (typeof data === 'string')
+        ? data.charCodeAt(data.length - 1)
+        : data[data.length - 1];
+    terminalAtLineStart = (last == 10) || (last == 13);
+}
+
+// Everything the module writes to stdout and stderr, byte for byte. Called from
+// wasm, which is where the log of a server run comes from.
+//
+// The bytes are copied out of the heap rather than passed on as a view of it:
+// the module's memory is shared, and xterm.js holds what it is given until it
+// has drawn it.
+function emloop_terminal_output(ptr, len) {
+    terminalWrite(HEAPU8.slice(ptr, ptr + len));
+}
+
+// One line the page printed itself, rather than the module. It shares the
+// screen with what the module has written, so it takes a line of its own rather
+// than landing in the middle of a prompt.
+function terminalPrintLine(text) {
+    if (!terminalMode) {
+        return;
+    }
+    terminalWrite((terminalAtLineStart ? '' : '\n') + text + '\n');
+}
+
+// Hand what was typed to the module as raw bytes.
+function sendTerminalInput(data) {
+    if (!emloop_terminal_input || !data) {
+        return;
+    }
+    // Not stringToNewUTF8: a terminal can produce a NUL byte (Ctrl+Space), and
+    // a C string would end there.
+    const bytes = new TextEncoder().encode(data);
+    const buf = _malloc(bytes.length);
+    HEAPU8.set(bytes, buf);
+    emloop_terminal_input(buf, bytes.length);
+    _free(buf);
+}
+
+// The terminal fills what is left of the window below the header, which is the
+// area the canvas would have had.
+function fitTerminal() {
+    if (!xTerminal) {
+        return;
+    }
+    const headerHeight = document.getElementById('header').offsetHeight;
+    terminalContainer.style.top = `${headerHeight}px`;
+    terminalContainer.style.height =
+        `${document.documentElement.clientHeight - headerHeight}px`;
+    xTerminalFit.fit();
+}
+
 // The settings menu hangs off the gear button in the top right corner.
 // It holds the console toggle and the address other players use to reach
 // this instance.
@@ -661,12 +863,18 @@ function syncConsoleState() {
         settingsConsoleToggle.innerText = shown ? 'Hide Console' : 'Show Console';
     }
     if (settingsButton) {
-        settingsButton.classList.toggle('over_console', shown);
+        settingsButton.classList.toggle('over_console', shown || terminalMode);
     }
 }
 
 function setupSettingsMenu() {
     syncConsoleState();
+
+    // The terminal already shows everything the console dock would, on the
+    // screen the dock would have taken a slice of.
+    if (terminalMode) {
+        settingsConsoleToggle.style.display = 'none';
+    }
 
     // Close the menu when a click lands anywhere else. Capture phase, because
     // the canvas swallows the events it receives.
@@ -969,6 +1177,7 @@ function consolePrint(text, echo = true) {
     }
     consoleText.push(text + "\n");
     consoleDirty = true;
+    terminalPrintLine(text);
     if (mtLauncher && mtLauncher.onprint) {
         mtLauncher.onprint(text);
     }
@@ -1015,6 +1224,12 @@ function fixGeometry(override) {
     if (!override && now() < fixGeometryPause) {
         return;
     }
+    // A server-only run has no canvas to size: the terminal has the screen.
+    if (terminalMode) {
+        fitTerminal();
+        return;
+    }
+
     var canvas = mtCanvas;
     var screenX;
     var screenY;
@@ -1226,6 +1441,12 @@ function doPaste(text) {
 }
 
 function setupClipboardHandlers() {
+    // There is no Irrlicht device to paste into on a server-only run, and the
+    // terminal does its own copy and paste.
+    if (terminalMode) {
+        return;
+    }
+
     // Capture phase, and registered before the wasm module installs its own
     // handlers, so this runs first and can keep the keypress from SDL.
     window.addEventListener('keydown', (e) => {
@@ -2377,8 +2598,21 @@ class LuantiLauncher {
             // prompt Firefox shows here.
             this.requestPersistence();
         }
+        // A server has no game window, so the page shows a terminal where the
+        // canvas would have been. activateBody() reads this.
+        terminalMode = this.args.server;
+        if (terminalMode) {
+            // What the page has printed up to here. From this point on the
+            // module prints to the terminal itself.
+            terminalWrite(consoleText.join(''));
+        }
         activateBody();
         fixGeometry();
+        if (terminalMode) {
+            startTerminal().catch((err) => {
+                consolePrint(`Could not start the terminal: ${err.message}`);
+            });
+        }
         if (this.conf.size > 0 || this.confOverrides.size > 0) {
             const defaults = this.#renderConf(this.conf);
             const overrides = this.#renderConf(this.confOverrides);

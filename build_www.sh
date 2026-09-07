@@ -53,6 +53,12 @@ apply_substitutions worker.js "$RELEASE_DIR"/worker.js
 apply_substitutions htaccess_packs "$PACKS_DIR"/.htaccess
 popd
 
+# xterm.js, which is the whole interface for a server-only run. Fetching it is
+# a no-op once the tarballs are in sources/, so this stays correct for a build
+# started from incremental.sh as well as from build_all.sh.
+"$BASE_DIR"/fetch_xterm.sh
+cp -a "$SOURCES_DIR/xterm" "$RELEASE_DIR"/xterm
+
 # Copy base file system pack
 cp "$BUILD_DIR/fsroot.tar.zst" "$PACKS_DIR/base.pack"
 
