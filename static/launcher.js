@@ -76,7 +76,7 @@ canvas.emscripten {
   -webkit-appearance: none;
   background-color: transparent;
   /* The gear is drawn in currentColor */
-  color: black;
+  color: #313639;
   cursor: pointer;
 }
 
@@ -97,11 +97,15 @@ canvas.emscripten {
   color: black;
 }
 
-#settings_console_toggle {
+#settings_exit, #settings_console_toggle {
   display: block;
   width: 100%;
   padding: 6px 0;
   cursor: pointer;
+}
+
+#settings_exit {
+  margin-bottom: 6px;
 }
 
 #settings_address_label {
@@ -248,6 +252,7 @@ const rtHTML = `
       </svg>
     </button>
     <div id="settings_menu" style="display: none">
+      <button id="settings_exit" onclick="exitLuanti()" title="Shut the game down, as Ctrl-C would">Exit Luanti</button>
       <button id="settings_console_toggle" onclick="consoleToggle()">Show Console</button>
       <div id="settings_address_label">Virtual IP Address</div>
       <span id="settings_address" onclick="selectAddress()"></span>
@@ -278,6 +283,7 @@ var progressBarDiv;
 var settingsPanel;
 var settingsButton;
 var settingsMenu;
+var settingsExit;
 var settingsConsoleToggle;
 var settingsAddress;
 var settingsAddressCopy;
@@ -321,6 +327,7 @@ function activateBody() {
     settingsPanel = document.getElementById('settings_panel');
     settingsButton = document.getElementById('settings_button');
     settingsMenu = document.getElementById('settings_menu');
+    settingsExit = document.getElementById('settings_exit');
     settingsConsoleToggle = document.getElementById('settings_console_toggle');
     settingsAddress = document.getElementById('settings_address');
     settingsAddressCopy = document.getElementById('settings_address_copy');
@@ -461,6 +468,7 @@ var emloop_zip_world;
 var emloop_install_zip;
 var emloop_set_conf;
 var emloop_invoke_main;
+var emloop_request_exit;
 var emloop_terminal_input;
 var emloop_terminal_resize;
 var irrlicht_resize;
@@ -483,6 +491,7 @@ function emloop_ready() {
                                ["number", "number", "number", "number", "number", "number"]);
     emloop_set_conf = cwrap("emloop_set_conf", null, ["number", "number"]);
     emloop_invoke_main = cwrap("emloop_invoke_main", null, ["number", "number"]);
+    emloop_request_exit = cwrap("emloop_request_exit", null, []);
     emloop_terminal_input = cwrap("emloop_terminal_input", null, ["number", "number"]);
     emloop_terminal_resize = cwrap("emloop_terminal_resize", null, ["number", "number"]);
     irrlicht_resize = cwrap("irrlicht_resize", null, ["number", "number"]);
@@ -611,6 +620,7 @@ function emloop_zip_installed(kind, name, ok) {
 // Called when main() has returned.
 function emloop_exited(status) {
     mtExited = true;
+    syncExitState();
     if (mtLauncher && mtLauncher.onexit) {
         mtLauncher.onexit(status);
     }
@@ -867,8 +877,26 @@ function syncConsoleState() {
     }
 }
 
+// Disabled before the module loads and after it has exited.
+function syncExitState() {
+    if (settingsExit) {
+        settingsExit.disabled = (!emloop_request_exit || mtExited);
+    }
+}
+
+// Shut the run down the way Ctrl-C would. main() returns once the game notices,
+// which arrives back here as emloop_exited().
+function exitLuanti() {
+    if (!emloop_request_exit || mtExited) {
+        return;
+    }
+    settingsHide();
+    emloop_request_exit();
+}
+
 function setupSettingsMenu() {
     syncConsoleState();
+    syncExitState();
 
     // The terminal already shows everything the console dock would, on the
     // screen the dock would have taken a slice of.
@@ -901,6 +929,7 @@ function settingsShow() {
     settingsMenu.style.display = 'block';
     settingsButton.setAttribute('aria-expanded', 'true');
     syncConsoleState();
+    syncExitState();
     refreshAddress();
 }
 
