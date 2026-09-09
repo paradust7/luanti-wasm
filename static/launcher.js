@@ -430,18 +430,7 @@ class LaunchScheduler {
 }
 const mtScheduler = new LaunchScheduler();
 
-// True when this page was opened from an invite link. Such a page only
-// tells a desktop player where to connect, and never runs the game.
-function isInvitePage() {
-    return new URLSearchParams(window.location.search).has('join');
-}
-
 function loadWasm() {
-    // Nothing on an invite page runs the game, so the module, which is a
-    // large download, is not fetched for one.
-    if (isInvitePage()) {
-        return;
-    }
     // Start loading the wasm module
     // The module will call emloop_ready when it is loaded
     // and waiting for main() arguments.
@@ -1106,11 +1095,14 @@ function joinHost(proxyUrl) {
     return new URL(proxyUrl).hostname;
 }
 
-// Asks the proxy which UDP port an invite link leads to.
+// Asks the proxy where an invite link leads.
 //
 // The answer is only half of what this does: it also tells the proxy that
 // this browser's address is the one allowed to use that port, which is what
-// lets desktop Luanti through. Resolves with the port number.
+// lets desktop Luanti through. Resolves with {port, address}: the port is
+// the proxy's own, for desktop Luanti, and the address is the host's on the
+// virtual network, which is what another browser connects to instead. A
+// proxy too old to name the address leaves it empty.
 function queryJoinCode(proxyUrl, joinCode) {
     return new Promise((resolve, reject) => {
         if (!/^[0-9a-f]{16}$/.test(joinCode)) {
@@ -1119,7 +1111,7 @@ function queryJoinCode(proxyUrl, joinCode) {
         }
         const ws = new WebSocket(proxyUrl);
         let settled = false;
-        const settle = (port, err) => {
+        const settle = (where, err) => {
             if (settled) {
                 return;
             }
@@ -1129,24 +1121,24 @@ function queryJoinCode(proxyUrl, joinCode) {
             if (err) {
                 reject(err);
             } else {
-                resolve(port);
+                resolve(where);
             }
         };
         ws.onopen = () => { ws.send('JOIN ' + joinCode); };
-        ws.onerror = () => { settle(0, new Error("Could not reach the server.")); };
-        ws.onclose = () => { settle(0, new Error("The server closed before answering.")); };
+        ws.onerror = () => { settle(null, new Error("Could not reach the server.")); };
+        ws.onclose = () => { settle(null, new Error("The server closed before answering.")); };
         ws.onmessage = (e) => {
             const parts = (typeof e.data === 'string') ? e.data.split(' ') : [];
-            if (parts.length === 3 && parts[0] === 'JOIN' && parts[1] === 'OK') {
+            if (parts.length >= 3 && parts[0] === 'JOIN' && parts[1] === 'OK') {
                 const port = Number(parts[2]);
                 if (Number.isInteger(port) && port > 0 && port < 65536) {
-                    settle(port, null);
+                    settle({port: port, address: parts[3] || ''}, null);
                     return;
                 }
             }
             // The usual reason: the host closed their game, so the invite
             // went with it.
-            settle(0, new Error("That invite is no longer valid. Ask for a new link."));
+            settle(null, new Error("That invite is no longer valid. Ask for a new link."));
         };
     });
 }

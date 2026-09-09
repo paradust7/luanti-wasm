@@ -198,9 +198,9 @@
           const joinStatus = document.getElementById('join_status');
           joinStatus.innerText = 'Contacting the server...';
           const proxyUrl = PROXIES[0][0];
-          queryJoinCode(proxyUrl, joinCode).then((port) => {
+          queryJoinCode(proxyUrl, joinCode).then((where) => {
               joinStatus.innerText =
-                  `You may now connect to: ${joinHost(proxyUrl)} ${port} in Luanti. ` +
+                  `You may now connect to: ${joinHost(proxyUrl)} ${where.port} in Luanti. ` +
                   `If you don't have an account on the server, be sure to ` +
                   `register first.`;
           }, (err) => {
