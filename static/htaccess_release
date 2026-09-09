@@ -8,4 +8,9 @@ Header set Cross-Origin-Embedder-Policy "require-corp"
 Header set Cross-Origin-Opener-Policy "same-origin"
 </Files>
 
+<Files "lockworker.js">
+Header set Cross-Origin-Embedder-Policy "require-corp"
+Header set Cross-Origin-Opener-Policy "same-origin"
+</Files>
+
 Header set Cache-Control "public, max-age=31536000, immutable"

@@ -610,8 +610,11 @@ function emloop_zip_installed(kind, name, ok) {
 function emloop_exited(status) {
     mtExited = true;
     syncExitState();
-    if (mtLauncher && mtLauncher.onexit) {
-        mtLauncher.onexit(status);
+    if (mtLauncher) {
+        mtLauncher.releaseStorageLock();
+        if (mtLauncher.onexit) {
+            mtLauncher.onexit(status);
+        }
     }
 }
 
@@ -1507,6 +1510,124 @@ function setupClipboardHandlers() {
     });
 }
 
+// The panel shown when the game cannot start because another window is
+// already running it. It is drawn over whatever the page is showing rather
+// than replacing it, so that cancelling leaves the player where they were.
+const busyCSS = `
+#luanti_busy_overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: rgba(0, 0, 0, 0.65);
+  font-family: arial, sans-serif;
+}
+
+#luanti_busy_panel {
+  box-sizing: border-box;
+  max-width: 440px;
+  margin: 16px;
+  padding: 20px 24px 24px 24px;
+  border-radius: 8px;
+  background-color: #2b2f31;
+  color: #e8e8e8;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.6);
+  text-align: center;
+}
+
+#luanti_busy_panel h2 {
+  margin: 0 0 12px 0;
+  font-size: 18px;
+  font-weight: bold;
+}
+
+#luanti_busy_panel p {
+  margin: 0 0 20px 0;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+#luanti_busy_buttons {
+  display: flex;
+  justify-content: center;
+}
+
+#luanti_busy_buttons button {
+  min-width: 120px;
+  margin: 0 6px;
+  padding: 9px 16px;
+  font-size: 14px;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+#luanti_busy_cancel {
+  background-color: #4a4f52;
+  color: #e8e8e8;
+}
+
+#luanti_busy_retry {
+  background-color: #3d7ab5;
+  color: #ffffff;
+}
+`;
+
+const busyHTML = `
+  <div id="luanti_busy_panel" role="alertdialog" aria-modal="true"
+       aria-labelledby="luanti_busy_title" aria-describedby="luanti_busy_text">
+    <h2 id="luanti_busy_title">Luanti is running in another window</h2>
+    <p id="luanti_busy_text">Only one window at a time can use the saved games
+      and settings stored in this browser. Close the other window, then try
+      again.</p>
+    <div id="luanti_busy_buttons">
+      <button id="luanti_busy_cancel" type="button">Cancel</button>
+      <button id="luanti_busy_retry" type="button">Try Again</button>
+    </div>
+  </div>
+`;
+
+// Puts the panel up and resolves to true if the player wants to try again,
+// false if they gave up.
+function askBusy() {
+    return new Promise((resolve) => {
+        if (!document.getElementById('luanti_busy_style')) {
+            const style = document.createElement('style');
+            style.id = 'luanti_busy_style';
+            style.innerText = busyCSS;
+            document.head.appendChild(style);
+        }
+        const overlay = document.createElement('div');
+        overlay.id = 'luanti_busy_overlay';
+        overlay.innerHTML = busyHTML;
+        document.body.appendChild(overlay);
+
+        const answer = (retry) => {
+            document.removeEventListener('keydown', onKey, true);
+            overlay.remove();
+            resolve(retry);
+        };
+        const onKey = (e) => {
+            if (e.key == 'Escape') {
+                e.preventDefault();
+                e.stopPropagation();
+                answer(false);
+            }
+        };
+        document.addEventListener('keydown', onKey, true);
+        document.getElementById('luanti_busy_cancel')
+            .addEventListener('click', () => answer(false));
+        const retryButton = document.getElementById('luanti_busy_retry');
+        retryButton.addEventListener('click', () => answer(true));
+        retryButton.focus();
+    });
+}
+
 class LuantiArgs {
     constructor() {
         this.go = false;
@@ -1616,6 +1737,10 @@ const GAMES_DIR = 'luanti/games';
 
 // Luanti settings file
 const CONF_FILE = 'luanti/minetest.conf';
+
+// The file the lock that keeps two windows apart is taken on. Nothing reads or
+// writes it; it exists only to be locked. See StorageLock.
+const LOCK_FILE = 'luanti/.lockfile';
 
 // These packs install outside /luanti (the CA certificate bundle lands in
 // /etc/ssl/certs, which is always in memory), so they cannot be remembered and
@@ -1876,6 +2001,82 @@ async function readPackVersion(root, name) {
     }
 }
 
+// Only one browser window at a time can run Luanti from persistent storage,
+// or else corruption may occur. So when persistent storage is enabled, this
+// lock is held while the game is running.
+class StorageLock {
+    #worker = null;
+    #held = false;
+
+    // Returns True on success, false if another window is holding the lock.
+    async acquire() {
+        if (this.#held) {
+            return true;
+        }
+        let reply;
+        try {
+            reply = await this.#ask({ cmd: 'lock', path: LOCK_FILE });
+        } catch (err) {
+            alert(`Could not lock persistent storage: ${err.message}`);
+            return false;
+        }
+        if (reply.ok) {
+            this.#held = true;
+            return true;
+        }
+        if (reply.error == 'NoModificationAllowedError' ||
+            reply.error == 'InvalidStateError') {
+            return false;
+        }
+        consolePrint(`Could not lock persistent storage: ${reply.error}`);
+        return true;
+    }
+
+    release() {
+        if (this.#worker) {
+            // Ending the worker releases the handle, and still works while the
+            // page is being torn down.
+            this.#worker.terminate();
+            this.#worker = null;
+        }
+        this.#held = false;
+    }
+
+    // Sends one command to the worker and waits for the answer to that command.
+    #ask(msg) {
+        if (!this.#worker) {
+            // The plain constructor: the wrapper at the top of this file is
+            // there for the module's own workers.
+            this.#worker = new NativeWorker(RELEASE_DIR + '/lockworker.js');
+        }
+        const worker = this.#worker;
+        return new Promise((resolve, reject) => {
+            const done = (fn, arg) => {
+                worker.removeEventListener('message', onMessage);
+                worker.removeEventListener('error', onError);
+                fn(arg);
+            };
+            const onMessage = (event) => {
+                if (event.data && event.data.cmd == msg.cmd) {
+                    done(resolve, event.data);
+                }
+            };
+            const onError = () => {
+                // A worker that could not be loaded is no use for the next
+                // question either.
+                worker.terminate();
+                if (this.#worker === worker) {
+                    this.#worker = null;
+                }
+                done(reject, new Error(`${RELEASE_DIR}/lockworker.js failed to load`));
+            };
+            worker.addEventListener('message', onMessage);
+            worker.addEventListener('error', onError);
+            worker.postMessage(msg);
+        });
+    }
+}
+
 // Firefox creates files in persistent storage about ten times slower than
 // other browsers do, and unpacking a game means creating thousands of them,
 // which takes minutes. Firefox forks carry the same engine and the same cost,
@@ -1902,6 +2103,13 @@ function getDefaultStorage() {
 class LuantiLauncher {
     #storageProbe = null;
 
+    // Set by launch() and cleared again if the player cancels, so that a
+    // launch waiting on another window cannot be started a second time.
+    #launching = false;
+
+    // Held for as long as this window is the one running the game.
+    #lock = new StorageLock();
+
     // Games installed from a ZIP the player dropped on the page. Persistent
     // storage remembers these by the version recorded for the pack; this is
     // what carries one through a visit that is not storing anything.
@@ -1918,6 +2126,9 @@ class LuantiLauncher {
         this.onerror = null; // function(message)
         this.onprint = null; // function(text)
         this.onexit = null; // function(status) when main() returns
+        // Called when the player cancels a launch that was blocked by
+        // another window. Defaults to reloading the page.
+        this.oncancel = null;
         this.addedPacks = new Set();
         // pack name -> a promise settled once the module has unpacked it.
         this.packInstalls = new Map();
@@ -1943,6 +2154,14 @@ class LuantiLauncher {
         this.storageRoot = null;
         this.storageAvailable = false;
         this.storageActive = false;
+
+        // The lock would go away on its own when the page is destroyed, but doing it
+        // here makes it happen sooner.
+        window.addEventListener('pagehide', (event) => {
+            if (!event.persisted) {
+                this.#lock.release();
+            }
+        });
 
         mtScheduler.addCondition("storageProbed");
         this.#storageProbe = this.#probeStorage();
@@ -1970,10 +2189,11 @@ class LuantiLauncher {
         return this.storageActive;
     }
 
-    // True once launch() has handed the page over to the game. Nothing can be
-    // installed or removed after that: the module is running Luanti.
+    // True once launch() has been called and not cancelled. Nothing can be
+    // installed or removed after that: the module is running Luanti, or is
+    // about to be once another window lets go of it.
     isLaunched() {
-        return mtScheduler.isSet("launch_called");
+        return this.#launching || mtScheduler.isSet("launch_called");
     }
 
     // The packs left in persistent storage by this or an earlier visit, as
@@ -2592,11 +2812,12 @@ class LuantiLauncher {
         return installDone;
     }
 
-    // Launch luanti.exe <args>
+    // Initiate launch of luanti.exe <args>
     //
-    // This must be called from a keyboard or mouse event handler,
-    // after the 'onready' event has fired. (For this reason, it cannot
-    // be called from the `onready` handler)
+    // The launch may be delayed if there's another window holding the
+    // persistent storage lock. If that happens, a panel will appear prompting
+    // the user to close the other window, then click retry. The user may also
+    // choose to cancel.
     launch(args) {
         if (!this.isReady()) {
             throw new Error("launch called before onready");
@@ -2604,19 +2825,67 @@ class LuantiLauncher {
         if (!(args instanceof LuantiArgs)) {
             throw new Error("launch called without LuantiArgs");
         }
-        if (mtScheduler.isSet("launch_called")) {
+        if (this.isLaunched()) {
             throw new Error("launch called twice");
         }
+        this.#launching = true;
         this.args = args;
+        // Start asynchronously loading the packs.
         if (this.args.gameid) {
             this.addPack(this.args.gameid);
         }
         this.addPacks(this.args.packs);
+        // Final lock check
+        this.#launchWhenFree().catch((err) => {
+            if (this.onerror) {
+                this.onerror(`${err}`);
+            } else {
+                console.error(err);
+            }
+        });
+    }
+
+    // Waits for any other window to let go of the storage lock, takes it, and
+    // then starts the game. See launch().
+    async #launchWhenFree() {
+        while (!(await this.#takeStorageLock())) {
+            if (!(await askBusy())) {
+                // The lock was never taken, so there is nothing to give
+                // back: the page is as it was and launching again is allowed.
+                this.#launching = false;
+                this.args = null;
+                if (this.oncancel) {
+                    this.oncancel();
+                } else {
+                    window.location.reload();
+                }
+                return;
+            }
+        }
+        this.#startGame();
+    }
+
+    // Takes the exclusive lock. Returns true on success, false on failure.
+    // If persistent storage is off, this always returns true.
+    async #takeStorageLock() {
+        await this.#storageProbe;
+        if (!this.storageAvailable || !(await mtFsActive)) {
+            return true;
+        }
+        return await this.#lock.acquire();
+    }
+
+    // Called when Luanti exits
+    releaseStorageLock() {
+        this.#lock.release();
+    }
+
+    // Launches Luanti for real. Only called once the lock is held.
+    #startGame() {
         if (this.storageActive) {
             // Without this the saved worlds are only kept on a best-effort
-            // basis and the browser may evict them. launch() is called from a
-            // user gesture, which is the right moment for the permission
-            // prompt Firefox shows here.
+            // basis and the browser may evict them. This runs just after the
+            // click that called launch(). Some browsers may show a prompt here.
             this.requestPersistence();
         }
         // A server has no game window, so the page shows a terminal where the
